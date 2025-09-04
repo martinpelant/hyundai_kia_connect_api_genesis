@@ -1,49 +1,48 @@
 """ApiImplType1.py"""
 
 import datetime as dt
-import requests
 import logging
 import math
-from typing import Optional
 from datetime import timedelta, timezone
 
-
 from time import sleep
+from typing import Optional
 
+import requests
 
 from .ApiImpl import (
     ApiImpl,
-    ScheduleChargingClimateRequestOptions,
     ClimateRequestOptions,
+    ScheduleChargingClimateRequestOptions,
     WindowRequestOptions,
 )
-from .Token import Token
-from .Vehicle import Vehicle
-
-from .utils import get_child_value, parse_datetime, get_index_into_hex_temp
 
 from .const import (
-    DOMAIN,
     DISTANCE_UNITS,
+    DOMAIN,
     ENGINE_TYPES,
+    ORDER_STATUS,
     SEAT_STATUS,
     TEMPERATURE_UNITS,
     VEHICLE_LOCK_ACTION,
-    ORDER_STATUS,
 )
 
 from .exceptions import (
     APIError,
     AuthenticationError,
+    DeviceIDError,
     DuplicateRequestError,
+    InvalidAPIResponseError,
+    NoDataFound,
+    PINMissingError,
+    RateLimitingError,
     RequestTimeoutError,
     ServiceTemporaryUnavailable,
-    NoDataFound,
-    InvalidAPIResponseError,
-    RateLimitingError,
-    DeviceIDError,
-    PINMissingError,
 )
+from .Token import Token
+
+from .utils import get_child_value, get_index_into_hex_temp, parse_datetime
+from .Vehicle import Vehicle
 
 USER_AGENT_OK_HTTP: str = "okhttp/3.12.0"
 
@@ -149,7 +148,9 @@ class ApiImplType1(ApiImpl):
             lastTwo = int(value[-2:])
             if lastTwo > 60:
                 value = int(value) + 40
-            if int(value) > 1260:
+            if int(value) == 0:
+                value = dt.time(0, 0)
+            elif int(value) > 1260:
                 value = dt.datetime.strptime(str(value), "%H%M").time()
             else:
                 d = dt.datetime.strptime(str(value), "%I%M")
@@ -753,7 +754,8 @@ class ApiImplType1(ApiImpl):
                 temperature = 17.0
 
         payload = {
-            "reservChargeInfo" + str(i + 1): {
+            "reservChargeInfo"
+            + str(i + 1): {
                 "reservChargeSet": departures[i].enabled,
                 "reservInfo": {
                     "day": departures[i].days,
