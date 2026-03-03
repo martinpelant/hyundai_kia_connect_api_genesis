@@ -12,6 +12,7 @@ import typing as ty
 from urllib.parse import parse_qs, urlparse
 
 import requests
+import pytz
 from bs4 import BeautifulSoup
 from zoneinfo import ZoneInfo
 
@@ -43,6 +44,7 @@ from .const import (
 )
 from .exceptions import (
     AuthenticationError,
+    APIError,
 )
 from .utils import (
     get_child_value,
@@ -54,6 +56,7 @@ _LOGGER = logging.getLogger(__name__)
 
 USER_AGENT_OK_HTTP: str = "okhttp/3.12.0"
 USER_AGENT_MOZILLA: str = "Mozilla/5.0 (Linux; Android 4.1.1; Galaxy Nexus Build/JRO03C) AppleWebKit/535.19 (KHTML, like Gecko) Chrome/18.0.1025.166 Mobile Safari/535.19"  # noqa
+USER_AGENT_GENESIS: str = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148_CCS_APP_iOS"  # noqa
 ACCEPT_HEADER_ALL: str = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9"  # noqa
 
 SUPPORTED_LANGUAGES_LIST = [
@@ -119,16 +122,16 @@ class KiaUvoApiEU(ApiImplType1):
             self.LOGIN_FORM_HOST = "https://idpconnect-eu.hyundai.com"
             self.PUSH_TYPE = "GCM"
         elif BRANDS[self.brand] == BRAND_GENESIS:
-            self.BASE_DOMAIN: str = "prd-eu-ccapi.genesis.com"
+            self.BASE_DOMAIN: str = "cci-api-eu.genesis.com"
             self.PORT: int = 443
-            self.CCSP_SERVICE_ID: str = "3020afa2-30ff-412a-aa51-d28fbe901e10"
+            self.CCSP_SERVICE_ID: str = "50e3b8b0-ced5-43b7-8a42-f86ac92fe50e"
             self.CCS_SERVICE_SECRET: str = "secret"
-            self.APP_ID: str = "f11f2b86-e0e7-4851-90df-5600b01d8b70"
+            self.APP_ID: str = "com.genesis.oneapp.eu"
             self.CFB: str = base64.b64decode(
                 "RFtoRq/vDXJmRndoZaZQyYo3/qFLtVReW8P7utRPcc0ZxOzOELm9mexvviBk/qqIp4A="
             )
             self.BASIC_AUTHORIZATION: str = "Basic MzAyMGFmYTItMzBmZi00MTJhLWFhNTEtZDI4ZmJlOTAxZTEwOkZLRGRsZWYyZmZkbGVGRXdlRUxGS0VSaUxFUjJGRUQyMXNEZHdkZ1F6NmhGRVNFMw=="  # noqa
-            self.LOGIN_FORM_HOST = "https://idpconnect-eu.genesis.com"
+            self.LOGIN_FORM_HOST = "idpconnect-eu.genesis.com"
             self.PUSH_TYPE = "GCM"
 
         self.BASE_URL: str = self.BASE_DOMAIN + ":" + str(self.PORT)
@@ -164,7 +167,7 @@ class KiaUvoApiEU(ApiImplType1):
                 + "&state=$service_id:$user_id"
             )
         elif BRANDS[self.brand] == BRAND_GENESIS:
-            auth_client_id = "3020afa2-30ff-412a-aa51-d28fbe901e10"
+            auth_client_id = "50e3b8b0-ced5-43b7-8a42-f86ac92fe50e"
             self.LOGIN_FORM_URL: str = (
                 "https://"
                 + self.LOGIN_FORM_HOST
@@ -188,22 +191,54 @@ class KiaUvoApiEU(ApiImplType1):
         device_id = self._get_device_id(stamp)
         cookies = self._get_cookies()
         self._set_session_language(cookies)
-        refresh_token = password
+        
+        authorization_code = None
+        # For Genesis brand, use the new authorization flow
+        if BRANDS[self.brand] == BRAND_GENESIS:
+            try:
+                authorization_code = self._get_authorization_code_genesis(
+                    username, password
+                )
+            except Exception as e:
+                _LOGGER.error(f"{DOMAIN} - Genesis authentication failed: {e}")
+                raise AuthenticationError("Genesis Login Failed") from e
+        else:
+            refresh_token = password
 
-        # Plaintext passwords can no longer be used due to reCaptcha
-        # requirements on the log in page. Users must provide a valid
-        # "refresh_token" to avoid "Received unexpected statusCode" errors.
-        if not re.match(r"^[A-Z0-9]{48}$", refresh_token):
-            raise AuthenticationError(
-                "Passwords are no longer supported, provide a refresh_token instead"
+            # Plaintext passwords can no longer be used due to reCaptcha
+            # requirements on the log in page. Users must provide a valid
+            # "refresh_token" to avoid "Received unexpected statusCode" errors.
+            if not re.match(r"^[A-Z0-9]{48}$", refresh_token):
+                raise AuthenticationError(
+                    "Passwords are no longer supported, provide a refresh_token instead"
+                )
+
+            _, access_token, authorization_code, expires_in = self._get_access_token(
+                stamp, refresh_token
+            )
+            valid_until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
+                seconds=expires_in
             )
 
+            return Token(
+                username=username,
+                password=password,
+                access_token=access_token,
+                refresh_token=refresh_token,
+                device_id=device_id,
+                valid_until=valid_until,
+                pin=pin,
+            )
+            
+        if authorization_code is None:
+            raise AuthenticationError("Login Failed")
+
         _, access_token, authorization_code, expires_in = self._get_access_token(
-            stamp, refresh_token
+            stamp, authorization_code
         )
-        valid_until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
-            seconds=expires_in
-        )
+        valid_until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=expires_in)
+
+        _, refresh_token = self._get_refresh_token(stamp, authorization_code)
 
         return Token(
             username=username,
@@ -214,6 +249,178 @@ class KiaUvoApiEU(ApiImplType1):
             valid_until=valid_until,
             pin=pin,
         )
+
+    def _get_authorization_code_genesis(self, username: str, password: str) -> str:
+        """
+        Authentication flow for Genesis brand.
+        """
+        _LOGGER.debug(f"{DOMAIN} - Using Genesis authentication flow")
+
+        # Create a session for handling cookies
+        session = requests.Session()
+        session.headers.update(
+            {
+                "User-Agent": USER_AGENT_GENESIS,
+                "Accept-Language": f"{self.LANGUAGE}-{self.LANGUAGE.upper()},{self.LANGUAGE};q=0.9",
+            }
+        )
+
+        # Step 1: Get initial cookie
+        url = f"https://{self.BASE_DOMAIN}/api/v1/user/oauth2/authorize?response_type=code&client_id={self.CCSP_SERVICE_ID}&redirect_uri=https://{self.LOGIN_FORM_HOST}/realms/eugenesisidm/ga-api/redirect2&lang={self.LANGUAGE}&scope=url.newapp"
+        response = session.get(url, allow_redirects=False)
+        _LOGGER.debug(
+            f"{DOMAIN} - Initial OAuth2 request status: {response.status_code}"
+        )
+        _LOGGER.debug(f"{DOMAIN} - Initial OAuth2 URL: {url}")
+
+        if response.status_code != 302:
+            _LOGGER.error(
+                f"{DOMAIN} - Initial OAuth2 request failed with status: {response.status_code}"
+            )
+            raise AuthenticationError("Failed to get initial OAuth2 redirect")
+
+        # Step 2: Follow redirect to authorize page
+        location_url = response.headers["Location"]
+        _LOGGER.debug(f"{DOMAIN} - Redirect location: {location_url}")
+        response = session.get(location_url)
+        _LOGGER.debug(
+            f"{DOMAIN} - Authorize page request status: {response.status_code}"
+        )
+
+        if response.status_code != 200:
+            _LOGGER.error(
+                f"{DOMAIN} - Failed to load authorize page with status: {response.status_code}"
+            )
+            raise AuthenticationError("Failed to load authorize page")
+
+        # Step 3: Get session
+        url = f"https://{self.BASE_DOMAIN}/api/v1/user/session"
+        response = session.get(url)
+        _LOGGER.debug(f"{DOMAIN} - Session request status: {response.status_code}")
+
+        if response.status_code != 204:
+            _LOGGER.error(
+                f"{DOMAIN} - Failed to establish session with status: {response.status_code}"
+            )
+            raise AuthenticationError("Failed to establish session")
+
+        # Step 4: Set language
+        url = f"https://{self.BASE_DOMAIN}/api/v1/user/language"
+        headers = {"Content-Type": "text/plain;charset=UTF-8"}
+        response = session.post(url, headers=headers, json={"lang": self.LANGUAGE})
+        _LOGGER.debug(f"{DOMAIN} - Set language request status: {response.status_code}")
+
+        if response.status_code != 204:
+            _LOGGER.error(
+                f"{DOMAIN} - Failed to set language with status: {response.status_code}"
+            )
+            raise AuthenticationError("Failed to set language")
+
+        # Step 5: Get integration info
+        url = f"https://{self.BASE_DOMAIN}/api/v1/user/integrationinfo"
+        response = session.get(url)
+        _LOGGER.debug(
+            f"{DOMAIN} - Integration info request status: {response.status_code}"
+        )
+
+        if response.status_code != 200:
+            _LOGGER.error(
+                f"{DOMAIN} - Failed to get integration info with status: {response.status_code}"
+            )
+            raise AuthenticationError("Failed to get integration info")
+
+        integration_info = response.json()
+        _LOGGER.debug(f"{DOMAIN} - Integration info: {integration_info}")
+        service_id = integration_info.get("serviceId")
+        user_id = integration_info.get("userId")
+
+        if not service_id or not user_id:
+            _LOGGER.error(
+                f"{DOMAIN} - Failed to extract service or user ID from integration info"
+            )
+            raise AuthenticationError("Failed to extract service or user ID")
+
+        # Step 6: Perform login
+        url = f"https://{self.LOGIN_FORM_HOST}/realms/eugenesisidm/protocol/openid-connect/auth?client_id=ga-gcs&scope=openid%20profile%20email%20phone&response_type=code&redirect_uri=https://{self.BASE_DOMAIN}/api/v1/user/integration/redirect/login&ui_locales={self.LANGUAGE}&state={service_id}:{user_id}"
+        _LOGGER.debug(f"{DOMAIN} - Login form URL: {url}")
+        response = session.get(url)
+        _LOGGER.debug(f"{DOMAIN} - Login page request status: {response.status_code}")
+
+        if response.status_code != 200:
+            _LOGGER.error(
+                f"{DOMAIN} - Failed to load login page with status: {response.status_code}"
+            )
+            raise AuthenticationError("Failed to load login page")
+
+        # Extract login action URL from response
+        match = re.search(r'"loginAction":\s*"(https://.*?)"', response.text)
+        if not match:
+            _LOGGER.error(f"{DOMAIN} - Could not find loginAction URL in response")
+            _LOGGER.debug(f"{DOMAIN} - Response content: {response.text[:500]}...")
+            raise AuthenticationError("Could not find loginAction URL")
+
+        login_action_url = match.group(1)
+        _LOGGER.debug(f"{DOMAIN} - Login action URL: {login_action_url}")
+
+        # Submit login credentials
+        payload = {"username": username, "password": password}
+        response = session.post(login_action_url, data=payload, allow_redirects=False)
+        _LOGGER.debug(f"{DOMAIN} - Login submission status: {response.status_code}")
+
+        if response.status_code != 302:
+            _LOGGER.error(
+                f"{DOMAIN} - Login submission failed with status: {response.status_code}"
+            )
+            _LOGGER.debug(
+                f"{DOMAIN} - Login response content: {response.text[:500]}..."
+            )
+            raise AuthenticationError("Login submission failed")
+
+        # Step 7: Follow redirects
+        redirect_url = response.headers["Location"]
+        _LOGGER.debug(f"{DOMAIN} - Redirect URL after login: {redirect_url}")
+        response = session.get(redirect_url, allow_redirects=True)
+        _LOGGER.debug(f"{DOMAIN} - Final redirect status: {response.status_code}")
+
+        if response.status_code != 200:
+            _LOGGER.error(
+                f"{DOMAIN} - Failed to follow login redirects with status: {response.status_code}"
+            )
+            raise AuthenticationError("Failed to follow login redirects")
+
+        # Step 8: Perform silent signin
+        url = f"https://{self.BASE_DOMAIN}/api/v1/user/silentsignin"
+        headers = {"Content-Type": "text/plain;charset=UTF-8"}
+        response = session.post(url, headers=headers, json={"intUserId": ""})
+        _LOGGER.debug(f"{DOMAIN} - Silent signin status: {response.status_code}")
+
+        if response.status_code != 200:
+            _LOGGER.error(
+                f"{DOMAIN} - Silent signin failed with status: {response.status_code}"
+            )
+            raise AuthenticationError("Silent signin failed")
+
+        redirect_url_with_code = response.json().get("redirectUrl")
+        if not redirect_url_with_code:
+            _LOGGER.error(f"{DOMAIN} - No redirect URL in silent signin response")
+            raise AuthenticationError("No redirect URL in silent signin response")
+
+        _LOGGER.debug(f"{DOMAIN} - Redirect URL with code: {redirect_url_with_code}")
+
+        # Extract authorization code from redirect URL
+        match = re.search(r"code=([^&]*)", redirect_url_with_code)
+        if not match:
+            _LOGGER.error(
+                f"{DOMAIN} - Could not extract authorization code from redirect URL"
+            )
+            raise AuthenticationError(
+                "Could not extract authorization code from redirect URL"
+            )
+
+        authorization_code = match.group(1)
+        _LOGGER.debug(f"{DOMAIN} - Genesis authorization code obtained successfully")
+
+        return authorization_code
 
     def update_vehicle_with_cached_state(self, token: Token, vehicle: Vehicle) -> None:
         url = self.SPA_API_URL + "vehicles/" + vehicle.id
@@ -1391,3 +1598,123 @@ class KiaUvoApiEU(ApiImplType1):
         token_type = response["token_type"]
         refresh_token = token_type + " " + response["access_token"]
         return token_type, refresh_token
+        
+    def _get_authenticated_headers(self, token: Token) -> dict:
+        if BRANDS[self.brand] == BRAND_GENESIS:
+            exchangeable_token = getattr(token, 'exchangeable_token', '')
+            # Genesis API expects these tokens without the Bearer prefix
+            if exchangeable_token and exchangeable_token.lower().startswith('bearer '):
+                exchangeable_token = exchangeable_token.split(" ", 1)[1]
+                
+            non_ccs_token = getattr(token, 'non_ccs_token', '')
+            if non_ccs_token and non_ccs_token.lower().startswith('bearer '):
+                non_ccs_token = non_ccs_token.split(" ", 1)[1]
+                
+            id_token = getattr(token, 'id_token', '')
+            if id_token and id_token.lower().startswith('bearer '):
+                id_token = id_token.split(" ", 1)[1]
+                
+            return {
+                'client-id': self.CLIENT_ID,
+                'client-name': 'MY GENESIS',
+                'client-version': '1.0.5',
+                'client-os-code': 'AOS',
+                'client-os-version': '33',
+                'accept-language': 'en-GB',
+                'locale': 'GB',
+                'timezone': 'Z',
+                'app-request-id': str(uuid.uuid4()),
+                'accept': 'application/json',
+                'user-agent': 'Ktor client',
+                'authorization': token.access_token,
+                'exchangeable-token': exchangeable_token,
+                'non-ccs-token': non_ccs_token,
+                'authentication': id_token
+            }
+        return super()._get_authenticated_headers(token)
+
+    def get_vehicles(self, token: Token) -> list[Vehicle]:
+        if BRANDS[self.brand] == BRAND_GENESIS:
+            url = f"https://{self.BASE_DOMAIN}/domain/api/v1/vehicle/available-vehicles?detail=true"
+            response = requests.get(url, headers=self._get_authenticated_headers(token))
+            if response.status_code != 200:
+                raise APIError(f"Failed to get vehicles: {response.status_code} {response.text}")
+            
+            data = response.json()
+            result = []
+            for entry in data.get("contents", []):
+                ccsp = entry.get("ccspVehicle", {})
+                car_type = ccsp.get("carType", "")
+                
+                entry_engine_type = None
+                if car_type == "GN":
+                    entry_engine_type = ENGINE_TYPES.ICE
+                elif car_type == "EV":
+                    entry_engine_type = ENGINE_TYPES.EV
+                elif car_type == "PHEV":
+                    entry_engine_type = ENGINE_TYPES.PHEV
+                elif car_type == "HEV":
+                    entry_engine_type = ENGINE_TYPES.HEV
+                
+                vehicle = Vehicle(
+                    id=entry.get("ccspCarId"),
+                    name=entry.get("vehicleNameView"),
+                    model=entry.get("vehicleModelName"),
+                    registration_date=ccsp.get("createdAt", ""),
+                    year=ccsp.get("detailInfo", {}).get("saleSpecYearCd", ""),
+                    VIN=entry.get("vin"),
+                    engine_type=entry_engine_type,
+                )
+                result.append(vehicle)
+            return result
+        return super().get_vehicles(token)
+
+    def refresh_access_token(self, token: Token) -> Token:
+        if BRANDS[self.brand] == BRAND_GENESIS:
+            url = f"https://{self.BASE_DOMAIN}/domain/api/v2/auth/token-refresh"
+            headers = self._get_authenticated_headers(token)
+            headers['authentication'] = getattr(token, 'id_token', '')
+            
+            def strip_bearer(t: str) -> str:
+                if t and t.lower().startswith('bearer '):
+                    return t.split(" ", 1)[1]
+                return t
+            
+            payload = {
+                "accessToken": strip_bearer(token.access_token),
+                "refreshToken": strip_bearer(token.refresh_token),
+                "exchangeableAccessToken": strip_bearer(getattr(token, 'exchangeable_token', '')),
+                "exchangeableRefreshToken": strip_bearer(getattr(token, 'exchangeable_refresh_token', '')),
+                "nonCcsToken": strip_bearer(getattr(token, 'non_ccs_token', '')),
+                "nonCcsRefreshToken": strip_bearer(getattr(token, 'non_ccs_refresh_token', ''))
+            }
+
+            response = requests.post(url, headers=headers, json=payload)
+            if response.status_code != 200:
+                raise AuthenticationError(f"Failed to refresh Genesis token: {response.text}")
+
+            data = response.json()
+            token_type = data.get("tokenType", "Bearer").capitalize()
+            
+            token.access_token = f"{token_type} {data['accessToken']}"
+            token.refresh_token = data.get('refreshToken', token.refresh_token)
+            token.exchangeable_token = data.get('exchangeableAccessToken', getattr(token, 'exchangeable_token', ''))
+            token.exchangeable_refresh_token = data.get('exchangeableRefreshToken', getattr(token, 'exchangeable_refresh_token', ''))
+            token.non_ccs_token = data.get('nonCcsToken', getattr(token, 'non_ccs_token', ''))
+            token.non_ccs_refresh_token = data.get('nonCcsRefreshToken', getattr(token, 'non_ccs_refresh_token', ''))
+            token.id_token = data.get('idToken', getattr(token, 'id_token', ''))
+            
+            expires_in = data.get("expiresTime", data.get("expiresIn", 3599))
+            token.valid_until = dt.datetime.now(pytz.utc) + dt.timedelta(seconds=expires_in)
+            return token
+        return super().refresh_access_token(token)
+
+    def test_token(self, token: Token) -> bool:
+        if BRANDS[self.brand] == BRAND_GENESIS:
+            url = f"https://{self.BASE_DOMAIN}/domain/api/v1/vehicle/available-vehicles"
+            try:
+                response = requests.get(url, headers=self._get_authenticated_headers(token))
+                return response.status_code == 200
+            except Exception:
+                return False
+        return super().test_token(token)

@@ -20,6 +20,13 @@ class Token:
     stamp: str = None
     pin: str = None
 
+    # Genesis OneApp specific tokens
+    id_token: str = None
+    exchangeable_token: str = None
+    exchangeable_refresh_token: str = None
+    non_ccs_token: str = None
+    non_ccs_refresh_token: str = None
+
     def to_dict(self) -> dict:
         """Convert Token to a JSON‑serializable dict."""
         data = asdict(self)
