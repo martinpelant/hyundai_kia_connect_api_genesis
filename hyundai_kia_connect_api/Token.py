@@ -20,6 +20,14 @@ class Token:
     stamp: str = None
     pin: str = None
 
+    # Genesis OneApp specific tokens
+    id_token: str = None
+    exchangeable_token: str = None
+    exchangeable_refresh_token: str = None
+    non_ccs_token: str = None
+    non_ccs_refresh_token: str = None
+    ccs_token: str = None
+
     def to_dict(self) -> dict:
         """Convert Token to a JSON‑serializable dict."""
         data = asdict(self)
@@ -46,4 +54,10 @@ class Token:
             valid_until=valid_until,
             stamp=data.get("stamp"),
             pin=data.get("pin"),
+            id_token=data.get("id_token"),
+            exchangeable_token=data.get("exchangeable_token"),
+            exchangeable_refresh_token=data.get("exchangeable_refresh_token"),
+            non_ccs_token=data.get("non_ccs_token"),
+            non_ccs_refresh_token=data.get("non_ccs_refresh_token"),
+            ccs_token=data.get("ccs_token"),
         )
