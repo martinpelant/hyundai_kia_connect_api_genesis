@@ -3,6 +3,7 @@
 # pylint:disable=missing-timeout,missing-class-docstring,missing-function-docstring,wildcard-import,unused-wildcard-import,invalid-name,logging-fstring-interpolation,broad-except,bare-except,super-init-not-called,unused-argument,line-too-long,too-many-lines
 
 import base64
+import json
 import random
 import datetime as dt
 import logging
@@ -218,6 +219,40 @@ class KiaUvoApiEU(ApiImplType1):
         self._set_session_language(cookies)
         
         authorization_code = None
+        # Support for encoded Genesis tokens
+        if password.startswith("G:"):
+            try:
+                encoded_data = password[2:]
+                token_data = json.loads(base64.b64decode(encoded_data).decode())
+                
+                # Reconstruct token
+                access_token = token_data.get("a")
+                if access_token and not access_token.lower().startswith("bearer "):
+                    access_token = f"Bearer {access_token}"
+                
+                valid_until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=23)
+                
+                token = Token(
+                    username=username,
+                    password=password,
+                    access_token=access_token,
+                    refresh_token=token_data.get("r"),
+                    device_id=device_id,
+                    valid_until=valid_until,
+                    pin=pin,
+                )
+                # Inject extra tokens
+                token.exchangeable_token = token_data.get("ea", "")
+                token.exchangeable_refresh_token = token_data.get("er", "")
+                token.non_ccs_token = token_data.get("nc", "")
+                token.non_ccs_refresh_token = token_data.get("nr", "")
+                token.id_token = token_data.get("it", "")
+                
+                return token
+            except Exception as e:
+                _LOGGER.error(f"{DOMAIN} - Failed to decode Genesis token string: {e}")
+                raise AuthenticationError("Invalid Genesis token string") from e
+
         # For Genesis brand, use the new authorization flow
         if BRANDS[self.brand] == BRAND_GENESIS:
             try:

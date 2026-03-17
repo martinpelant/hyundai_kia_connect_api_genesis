@@ -3,6 +3,7 @@ import uuid
 import time
 import requests
 import json
+import base64
 
 # Genesis EU Configuration
 CLIENT_ID = "50e3b8b0-ced5-43b7-8a42-f86ac92fe50e"
@@ -45,28 +46,45 @@ def exchange_code_for_tokens(code):
     
     if response.status_code == 200:
         data = response.json()
-        print("\n[+] SUCCESS! Tokens retrieved:\n")
-        print("AccessToken (GSPA):", str(data.get("accessToken"))[:50] + "...")
-        print("RefreshToken (GSPA):", data.get("refreshToken"))
-        print("\nAccessToken (IDP):", str(data.get("nonCcsToken"))[:50] + "...")
-        print("RefreshToken (IDP):", data.get("nonCcsRefreshToken"))
+        print("\n[+] SUCCESS! Tokens retrieved.")
         
-        # Save to file
+        # Create the combined token string for HA
+        # We prefix with 'G:' to make it easily identifiable by the library
+        token_data = {
+            "a": data.get("accessToken"),
+            "r": data.get("refreshToken"),
+            "ea": data.get("exchangeableAccessToken"),
+            "er": data.get("exchangeableRefreshToken"),
+            "nc": data.get("nonCcsToken"),
+            "nr": data.get("nonCcsRefreshToken"),
+            "it": data.get("idToken")
+        }
+        
+        json_str = json.dumps(token_data)
+        encoded_str = "G:" + base64.b64encode(json_str.encode()).decode()
+        
+        print("\n=== GENESIS ENCODED TOKEN STRING ===")
+        print("Copy and paste the entire line below into the PASSWORD field in Home Assistant:")
+        print("\n" + encoded_str + "\n")
+        print("====================================\n")
+        
+        # Also save raw json for reference
         with open("genesis_tokens.json", "w") as f:
             json.dump(data, f, indent=4)
-        print("\n[*] Tokens saved to genesis_tokens.json")
+        print("[*] Raw tokens also saved to genesis_tokens.json")
     else:
         print("\n[-] Failed to get tokens!")
         print("Status:", response.status_code)
         print("Response:", response.text)
 
 if __name__ == "__main__":
-    print("=== Genesis EU OAuth2 Login ===")
-    print("1. Open this URL in your web browser (you can use your computer's browser):")
+    print("=== Genesis EU OAuth2 Login Utility ===")
+    print("This script helps you get the tokens required for the Genesis Home Assistant integration.")
+    print("\n1. Open this URL in your web browser:")
     print("\n" + generate_login_url() + "\n")
-    print("2. Log in with your Genesis account and solve the CAPTCHA.")
-    print("3. You will eventually be redirected to a blank page or a 'site cannot be reached' error.")
-    print("4. Copy the ENTIRE URL from your browser's address bar (it should start with https://oneapp.genesis.com/redirect?code=...)")
+    print("2. Log in with your Genesis account and solve any CAPTCHAs.")
+    print("3. You will be redirected to a page that may error (oneapp.genesis.com/redirect).")
+    print("4. Copy the ENTIRE URL from your browser's address bar.")
     
     redirect_url = input("\nPaste the redirected URL here: ").strip()
     
@@ -77,7 +95,7 @@ if __name__ == "__main__":
         code = query_params.get('code', [None])[0]
         
         if not code:
-            print("[-] Could not find 'code' in the URL. Make sure you copied the whole thing.")
+            print("[-] Could not find 'code' in the URL. Make sure you copied the entire URL including the code= part.")
         else:
             print(f"[*] Found authorization code: {code}")
             exchange_code_for_tokens(code)
