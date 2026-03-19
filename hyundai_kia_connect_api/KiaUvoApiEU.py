@@ -1674,7 +1674,9 @@ class KiaUvoApiEU(ApiImplType1):
                 'authorization': token.access_token,
                 'exchangeable-token': exchangeable_token,
                 'non-ccs-token': non_ccs_token,
-                'authentication': id_token
+                'authentication': id_token,
+                'ccsp-device-id': token.device_id or self._get_device_id(self._get_stamp()),
+                'Brand': 'genesis'
             }
         return super()._get_authenticated_headers(token, ccs2_support)
 
