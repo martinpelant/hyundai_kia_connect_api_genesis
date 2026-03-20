@@ -1746,10 +1746,18 @@ class KiaUvoApiEU(ApiImplType1):
             
             token.access_token = f"{token_type} {data['accessToken']}"
             token.refresh_token = data.get('refreshToken', token.refresh_token)
-            token.exchangeable_token = data.get('exchangeableAccessToken', getattr(token, 'exchangeable_token', ''))
-            token.exchangeable_refresh_token = data.get('exchangeableRefreshToken', getattr(token, 'exchangeable_refresh_token', ''))
-            token.non_ccs_token = data.get('nonCcsToken', getattr(token, 'non_ccs_token', ''))
-            token.non_ccs_refresh_token = data.get('nonCcsRefreshToken', getattr(token, 'non_ccs_refresh_token', ''))
+            
+            # Genesis Session Rotation:
+            # The 'connector' object contains the true rolling refresh tokens (hmgid1.0).
+            # We must use these to extend the session, otherwise the root nonCcsRefreshToken
+            # will expire in 2 hours and cause a 9009 error.
+            connector = data.get("connector", {})
+            hmg = connector.get("hmgid1.0", {})
+            
+            token.exchangeable_token = hmg.get('accessToken', data.get('exchangeableAccessToken', getattr(token, 'exchangeable_token', '')))
+            token.exchangeable_refresh_token = hmg.get('refreshToken', data.get('exchangeableRefreshToken', getattr(token, 'exchangeable_refresh_token', '')))
+            token.non_ccs_token = hmg.get('accessToken', data.get('nonCcsToken', getattr(token, 'non_ccs_token', '')))
+            token.non_ccs_refresh_token = hmg.get('refreshToken', data.get('nonCcsRefreshToken', getattr(token, 'non_ccs_refresh_token', '')))
             token.id_token = data.get('idToken', getattr(token, 'id_token', ''))
             
             expires_in = data.get("expiresTime", data.get("expiresIn", 3599))
