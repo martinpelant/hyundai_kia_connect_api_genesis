@@ -1749,11 +1749,7 @@ class KiaUvoApiEU(ApiImplType1):
             token.exchangeable_token = data.get('exchangeableAccessToken', getattr(token, 'exchangeable_token', ''))
             token.exchangeable_refresh_token = data.get('exchangeableRefreshToken', getattr(token, 'exchangeable_refresh_token', ''))
             token.non_ccs_token = data.get('nonCcsToken', getattr(token, 'non_ccs_token', ''))
-            # DO NOT overwrite non_ccs_refresh_token. The Genesis server returns an invalid/unusable token
-            # for this specific field during token-refresh, causing subsequent refreshes to fail with a 400
-            # error ("Received an expired token error response from IDP Connect"). 
-            # We must preserve the original non_ccs_refresh_token generated during the initial login.
-            # token.non_ccs_refresh_token = data.get('nonCcsRefreshToken', getattr(token, 'non_ccs_refresh_token', ''))
+            token.non_ccs_refresh_token = data.get('nonCcsRefreshToken', getattr(token, 'non_ccs_refresh_token', ''))
             token.id_token = data.get('idToken', getattr(token, 'id_token', ''))
             
             expires_in = data.get("expiresTime", data.get("expiresIn", 3599))
