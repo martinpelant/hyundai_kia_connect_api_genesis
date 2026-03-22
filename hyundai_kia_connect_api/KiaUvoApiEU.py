@@ -7,6 +7,8 @@ import json
 import random
 import datetime as dt
 import logging
+import time
+import hashlib
 import uuid
 import re
 import typing as ty
@@ -1669,6 +1671,8 @@ class KiaUvoApiEU(ApiImplType1):
                 'locale': 'GB',
                 'timezone': 'Z',
                 'app-request-id': str(uuid.uuid4()),
+                'x-timestamp': str(int(time.time() * 1000)),
+                'x-fingerprint': hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest(),
                 'accept': 'application/json',
                 'user-agent': 'Ktor client',
                 'authorization': token.access_token,
