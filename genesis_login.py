@@ -1,6 +1,7 @@
 import urllib.parse
 import uuid
 import time
+import hashlib
 import requests
 import json
 import base64
@@ -8,25 +9,90 @@ import base64
 # Genesis EU Configuration
 CLIENT_ID = "50e3b8b0-ced5-43b7-8a42-f86ac92fe50e"
 REDIRECT_URI = "https://oneapp.genesis.com/redirect"
-SCOPE = "account.token.transfer account.id.generate account.puid.userinfos account.userinfo read account.userinfos puid email name mobileNum birthdate lang country signUpDate gender nationInfo certProfile offline"
+SCOPE = "account.token.transfer account.id.generate account.puid.userinfos account.userinfo puid name email mobileNum birthdate lang country signUpDate certProfile offline gender nationInfo account.userinfos"
 
 def generate_login_url():
     """Generates the URL the user must visit to log in."""
+    state_obj = {
+        "scope": SCOPE,
+        "state": None,
+        "lang": "en",
+        "cert": "",
+        "action": "idpc_auth_endpoint",
+        "country": None,
+        "client_id": CLIENT_ID,
+        "redirect_uri": "https://idpconnect-eu.genesis.com/auth/redirect",
+        "response_type": "code",
+        "signup_link": None,
+        "hmgid2_client_id": CLIENT_ID,
+        "hmgid2_redirect_uri": REDIRECT_URI,
+        "hmgid2_scope": SCOPE,
+        "hmgid2_state": "hmgoneapp",
+        "hmgid2_ui_locales": "en-GB"
+    }
+    state_b64 = base64.b64encode(json.dumps(state_obj).encode()).decode()
+
     params = {
         "client_id": CLIENT_ID,
-        "redirect_uri": REDIRECT_URI,
+        "redirect_uri": "https://idpconnect-eu.genesis.com/auth/redirect",
         "response_type": "code",
+        "state": state_b64,
+        "cert": "",
+        "action": "idpc_auth_endpoint",
+        "lang": "en",
         "scope": SCOPE,
-        "state": "hmgoneapp",
-        "ui_locales": "en-GB"
+        "sso_session_reset": "true"
     }
-    url = "https://idpconnect-eu.genesis.com/auth/api/v2/user/oauth2/authorize?" + urllib.parse.urlencode(params)
-    return url
+
+    url = "https://prd-eu-ccapi.genesis.com/api/v1/user/openid/connector/common/authorize?" + urllib.parse.urlencode(params)
+    res = requests.get(url, allow_redirects=False)
+    
+    connector_session_key = ""
+    if res.status_code == 302 and "Location" in res.headers:
+        loc = res.headers["Location"]
+        parsed = urllib.parse.urlparse(loc)
+        qs = urllib.parse.parse_qs(parsed.query)
+        if "next_uri" in qs:
+            next_uri = qs["next_uri"][0]
+            parsed_next = urllib.parse.urlparse(next_uri)
+            qs_next = urllib.parse.parse_qs(parsed_next.query)
+            if "connector_session_key" in qs_next:
+                connector_session_key = qs_next["connector_session_key"][0]
+
+    if not connector_session_key:
+        print("[-] Failed to generate connector_session_key!")
+        return url
+
+    final_params = {
+        "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "nonce": "",
+        "state": "hmgoneapp",
+        "scope": SCOPE,
+        "response_type": "code",
+        "ui_locales": "en-GB",
+        "connector_client_id": CLIENT_ID,  # Crucially without the hmgid1.0- prefix
+        "connector_scope": SCOPE,
+        "connector_session_key": connector_session_key,
+        "country": "",
+        "captcha": "1"
+    }
+    
+    # Genesis requires space to be %20 instead of +
+    qs_string = "&".join([f"{k}={urllib.parse.quote(v, safe='')}" for k, v in final_params.items()])
+    return "https://idpconnect-eu.genesis.com/auth/api/v2/user/oauth2/authorize?" + qs_string
 
 def exchange_code_for_tokens(code):
     """Exchanges the authorization code for access and refresh tokens."""
     url = f"https://cci-api-eu.genesis.com/domain/api/v1/auth/token?code={code}"
     
+    device_id = str(uuid.uuid4())
+    fingerprint = hashlib.sha256(device_id.encode()).hexdigest()
+    timestamp = str(int(time.time() * 1000))
+    
+    # Use exact app User-Agent to bypass 2-hour downgrade
+    ua = "Mozilla/5.0 (Linux; Android 13; sdk_gphone64_arm64 Build/TE1A.240213.009; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/109.0.5414.123 Mobile Safari/537.36 HKMCOneApp/1.0.5 (packageID=com.genesis.oneapp.eu,locale=US,lang=en-GB,platform=android,brand=genesis,theme=light,isUWB=false,isNFC=false,region=EU)/HMG_GA_AOS"
+
     headers = {
         'client-id': 'com.genesis.oneapp.eu',
         'client-name': 'MY GENESIS',
@@ -36,9 +102,11 @@ def exchange_code_for_tokens(code):
         'accept-language': 'en-GB',
         'locale': 'GB',
         'timezone': 'Z',
-        'app-request-id': str(uuid.uuid4()),
+        'app-request-id': device_id,
+        'x-fingerprint': fingerprint,
+        'x-timestamp': timestamp,
         'accept': 'application/json',
-        'user-agent': 'Ktor client'
+        'user-agent': ua
     }
 
     print("\n[*] Exchanging code for tokens...")
@@ -48,6 +116,25 @@ def exchange_code_for_tokens(code):
         data = response.json()
         print("\n[+] SUCCESS! Tokens retrieved.")
         
+        # Check token expiration to warn user
+        try:
+            import base64
+            nr = data.get("nonCcsRefreshToken", "")
+            if nr:
+                p = nr.split('.')[1]
+                p += '=' * (-len(p) % 4)
+                dec = json.loads(base64.b64decode(p).decode('utf-8'))
+                diff_hours = (dec['exp'] - dec['iat']) / 3600
+                if diff_hours < 24:
+                    print(f"\n[WARNING] Your token only has a {diff_hours:.1f}-hour lifespan!")
+                    print("This means the Home Assistant integration will disconnect overnight.")
+                    print("To get a 90-day token, you MUST open the login URL on a MOBILE DEVICE (phone browser)")
+                    print("or use Chrome Developer Tools (Device Mode) to simulate a mobile device.\n")
+                else:
+                    print(f"\n[+] Excellent! You received a {diff_hours/24:.1f}-day token. It should not expire overnight.\n")
+        except Exception:
+            pass
+
         # Create the combined token string for HA
         # We prefix with 'G:' to make it easily identifiable by the library
         token_data = {
@@ -80,7 +167,13 @@ def exchange_code_for_tokens(code):
 if __name__ == "__main__":
     print("=== Genesis EU OAuth2 Login Utility ===")
     print("This script helps you get the tokens required for the Genesis Home Assistant integration.")
-    print("\n1. Open this URL in your web browser:")
+    print("\n!!! CRITICAL INSTRUCTION FOR 90-DAY TOKENS !!!")
+    print("To prevent your session from expiring overnight (error 9009), you MUST open the URL")
+    print("below on a MOBILE DEVICE (e.g., your phone's browser) or use a desktop browser's")
+    print("Developer Tools to simulate a mobile device.")
+    print("If you use a standard desktop browser, you will only get a 2-hour token!")
+    print("----------------------------------------------")
+    print("\n1. Open this URL in your web browser (preferably on your phone):")
     print("\n" + generate_login_url() + "\n")
     print("2. Log in with your Genesis account and solve any CAPTCHAs.")
     print("3. You will be redirected to a page that may error (oneapp.genesis.com/redirect).")

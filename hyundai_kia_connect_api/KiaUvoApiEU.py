@@ -1748,16 +1748,18 @@ class KiaUvoApiEU(ApiImplType1):
             token.refresh_token = data.get('refreshToken', token.refresh_token)
             
             # Genesis Session Rotation:
-            # The 'connector' object contains the true rolling refresh tokens (hmgid1.0).
-            # We must use these to extend the session, otherwise the root nonCcsRefreshToken
-            # will expire in 2 hours and cause a 9009 error.
-            connector = data.get("connector", {})
-            hmg = connector.get("hmgid1.0", {})
+            # The 'connector' object contains the true rolling refresh tokens.
+            # 'hmgid1.0' contains the GSPA tokens, and 'oneid' contains the IDP tokens.
+            connector = data.get("connector") or {}
+            hmg = connector.get("hmgid1.0") or {}
+            oneid = connector.get("oneid") or {}
             
             token.exchangeable_token = hmg.get('accessToken', data.get('exchangeableAccessToken', getattr(token, 'exchangeable_token', '')))
             token.exchangeable_refresh_token = hmg.get('refreshToken', data.get('exchangeableRefreshToken', getattr(token, 'exchangeable_refresh_token', '')))
-            token.non_ccs_token = hmg.get('accessToken', data.get('nonCcsToken', getattr(token, 'non_ccs_token', '')))
-            token.non_ccs_refresh_token = hmg.get('refreshToken', data.get('nonCcsRefreshToken', getattr(token, 'non_ccs_refresh_token', '')))
+            
+            # IDP tokens are under 'oneid'. If missing, fallback to root nonCcs tokens.
+            token.non_ccs_token = oneid.get('accessToken', data.get('nonCcsToken', getattr(token, 'non_ccs_token', '')))
+            token.non_ccs_refresh_token = oneid.get('refreshToken', data.get('nonCcsRefreshToken', getattr(token, 'non_ccs_refresh_token', '')))
             token.id_token = data.get('idToken', getattr(token, 'id_token', ''))
             
             expires_in = data.get("expiresTime", data.get("expiresIn", 3599))
@@ -1768,7 +1770,8 @@ class KiaUvoApiEU(ApiImplType1):
 
     def test_token(self, token: Token) -> bool:
         if BRANDS[self.brand] == BRAND_GENESIS:
-            url = f"https://{self.BASE_DOMAIN}/domain/api/v1/vehicle/available-vehicles"
+            # Must include ?detail=true otherwise the Genesis API returns 401 Unauthorized
+            url = f"https://{self.BASE_DOMAIN}/domain/api/v1/vehicle/available-vehicles?detail=true"
             try:
                 response = requests.get(url, headers=self._get_authenticated_headers(token))
                 return response.status_code == 200
