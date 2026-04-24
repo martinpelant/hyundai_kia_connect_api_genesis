@@ -232,7 +232,7 @@ class KiaUvoApiEU(ApiImplType1):
                 if access_token and not access_token.lower().startswith("bearer "):
                     access_token = f"Bearer {access_token}"
                 
-                valid_until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=23)
+                valid_until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=50)
                 
                 token = Token(
                     username=username,
@@ -1767,6 +1767,8 @@ class KiaUvoApiEU(ApiImplType1):
             token.id_token = data.get('idToken', getattr(token, 'id_token', ''))
             
             expires_in = data.get("expiresTime", data.get("expiresIn", 3599))
+            if expires_in > 600:
+                expires_in -= 600
             token.valid_until = dt.datetime.now(pytz.utc) + dt.timedelta(seconds=expires_in)
             self._exchange_ccs_token(token)
             return token
