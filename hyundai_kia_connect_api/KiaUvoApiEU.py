@@ -1780,7 +1780,15 @@ class KiaUvoApiEU(ApiImplType1):
             url = f"https://{self.BASE_DOMAIN}/domain/api/v1/vehicle/available-vehicles?detail=true"
             try:
                 response = requests.get(url, headers=self._get_authenticated_headers(token))
-                return response.status_code == 200
+                if response.status_code != 200:
+                    return False
+                try:
+                    data = response.json()
+                    if isinstance(data, dict) and data.get("code") == 9030:
+                        return False
+                except Exception:
+                    pass
+                return True
             except Exception:
                 return False
         return super().test_token(token)

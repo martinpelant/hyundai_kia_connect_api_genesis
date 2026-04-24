@@ -83,10 +83,18 @@ def _check_response_for_errors(response: dict) -> None:
     }
 
     if not any(
-        x in response for x in ["retCode", "resCode", "resMsg", "error", "access_token"]
+        x in response for x in ["retCode", "resCode", "resMsg", "error", "access_token", "code"]
     ):
         _LOGGER.error(f"Unknown API response format: {response}")
         raise InvalidAPIResponseError()
+
+    if "code" in response:
+        if response["code"] == 9030:
+            raise AuthenticationError(response.get("message", "Token expired"))
+        elif response["code"] != 0:
+            raise APIError(
+                f"Server returned: '{response.get('code')}' '{response.get('message')}'"
+            )
 
     if "retCode" in response and response["retCode"] == "F":
         if response["resCode"] in error_code_mapping:
