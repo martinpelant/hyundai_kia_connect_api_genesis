@@ -1727,6 +1727,10 @@ class KiaUvoApiEU(ApiImplType1):
             headers = self._get_authenticated_headers(token)
             headers['authentication'] = getattr(token, 'id_token', '')
             
+            # Remove authorization headers as the token is expired and the API will reject the request with 401
+            headers.pop('authorization', None)
+            headers.pop('Authorization', None)
+            
             def strip_bearer(t: str) -> str:
                 if t and t.lower().startswith('bearer '):
                     return t.split(" ", 1)[1]
