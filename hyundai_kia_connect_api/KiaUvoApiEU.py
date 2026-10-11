@@ -4,10 +4,16 @@
 
 import base64
 import datetime as dt
+import hashlib
+import json
 import logging
+import random
 import re
+import time
 from time import sleep
+from typing import Optional
 from urllib.parse import parse_qs, urlparse
+import uuid
 from zoneinfo import ZoneInfo
 
 import requests
@@ -33,6 +39,7 @@ from .const import (
     TEMPERATURE_UNITS,
 )
 from .exceptions import (
+    APIError,
     AuthenticationError,
     ConsentRequiredError,
 )
@@ -51,6 +58,7 @@ _LOGGER = logging.getLogger(__name__)
 
 USER_AGENT_OK_HTTP: str = "okhttp/3.12.0"
 USER_AGENT_MOZILLA: str = "Mozilla/5.0 (Linux; Android 4.1.1; Galaxy Nexus Build/JRO03C) AppleWebKit/535.19 (KHTML, like Gecko) Chrome/18.0.1025.166 Mobile Safari/535.19"
+USER_AGENT_GENESIS: str = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148_CCS_APP_iOS"
 ACCEPT_HEADER_ALL: str = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9"
 
 SUPPORTED_LANGUAGES_LIST = [
@@ -74,7 +82,7 @@ SUPPORTED_LANGUAGES_LIST = [
 
 class KiaUvoApiEU(ApiImplType1):
     data_timezone = ZoneInfo("Europe/Berlin")
-    temperature_range = tuple(x * 0.5 for x in range(28, 60))
+    temperature_range = tuple(x * 0.5 for x in range(28, 64))
 
     def __init__(self, region: int, brand: int, language: str) -> None:
         language = language.lower()
@@ -116,24 +124,33 @@ class KiaUvoApiEU(ApiImplType1):
             self.LOGIN_FORM_HOST = "https://idpconnect-eu.hyundai.com"
             self.PUSH_TYPE = "GCM"
         elif BRANDS[self.brand] == BRAND_GENESIS:
-            self.BASE_DOMAIN: str = "prd-eu-ccapi.genesis.com"
+            self.BASE_DOMAIN: str = "cci-api-eu.genesis.com"
+            self.LEGACY_DOMAIN: str = "prd-eu-ccapi.genesis.com"
             self.PORT: int = 443
-            self.CCSP_SERVICE_ID: str = "3020afa2-30ff-412a-aa51-d28fbe901e10"
-            self.CCS_SERVICE_SECRET: str = (
-                "FKDdlef2ffdleFEweELFKERiLER2FED21sDdwdgQz6hFESE3"
-            )
-            self.APP_ID: str = "f11f2b86-e0e7-4851-90df-5600b01d8b70"
+            self.CCSP_SERVICE_ID: str = "50e3b8b0-ced5-43b7-8a42-f86ac92fe50e"
+            self.LEGACY_CCSP_SERVICE_ID: str = "3020afa2-30ff-412a-aa51-d28fbe901e10"
+            self.CCS_SERVICE_SECRET: str = "secret"
+            self.APP_ID: str = "com.genesis.oneapp.eu"
+            self.LEGACY_APP_ID: str = "f11f2b86-e0e7-4851-90df-5600b01d8b70"
             self.CFB: str = base64.b64decode(
                 "RFtoRq/vDXJmRndoZaZQyYo3/qFLtVReW8P7utRPcc0ZxOzOELm9mexvviBk/qqIp4A="
             )
             self.BASIC_AUTHORIZATION: str = "Basic MzAyMGFmYTItMzBmZi00MTJhLWFhNTEtZDI4ZmJlOTAxZTEwOkZLRGRsZWYyZmZkbGVGRXdlRUxGS0VSaUxFUjJGRUQyMXNEZHdkZ1F6NmhGRVNFMw=="
-            self.LOGIN_FORM_HOST = "https://idpconnect-eu.genesis.com"
+            self.LOGIN_FORM_HOST = "idpconnect-eu.genesis.com"
             self.PUSH_TYPE = "GCM"
 
         self.BASE_URL: str = self.BASE_DOMAIN + ":" + str(self.PORT)
         self.USER_API_URL: str = "https://" + self.BASE_URL + "/api/v1/user/"
-        self.SPA_API_URL: str = "https://" + self.BASE_URL + "/api/v1/spa/"
-        self.SPA_API_URL_V2: str = "https://" + self.BASE_URL + "/api/v2/spa/"
+        if BRANDS[self.brand] == BRAND_GENESIS:
+            self.SPA_API_URL: str = (
+                "https://" + self.LEGACY_DOMAIN + ":" + str(self.PORT) + "/api/v1/spa/"
+            )
+            self.SPA_API_URL_V2: str = (
+                "https://" + self.LEGACY_DOMAIN + ":" + str(self.PORT) + "/api/v2/spa/"
+            )
+        else:
+            self.SPA_API_URL: str = "https://" + self.BASE_URL + "/api/v1/spa/"
+            self.SPA_API_URL_V2: str = "https://" + self.BASE_URL + "/api/v2/spa/"
 
         self.CLIENT_ID: str = self.CCSP_SERVICE_ID
         self.GCM_SENDER_ID = 199360397125
@@ -181,12 +198,153 @@ class KiaUvoApiEU(ApiImplType1):
 
         self.session = ApiImplSession()
 
+    def _get_genesis_cci_headers(self, token: Token) -> dict:
+        exchangeable_token = getattr(token, "exchangeable_token", "") or ""
+        if exchangeable_token and exchangeable_token.lower().startswith("bearer "):
+            exchangeable_token = exchangeable_token.split(" ", 1)[1]
+
+        non_ccs_token = getattr(token, "non_ccs_token", "") or ""
+        if non_ccs_token and non_ccs_token.lower().startswith("bearer "):
+            non_ccs_token = non_ccs_token.split(" ", 1)[1]
+
+        id_token = getattr(token, "id_token", "") or ""
+        if id_token and id_token.lower().startswith("bearer "):
+            id_token = id_token.split(" ", 1)[1]
+
+        auth = token.access_token or ""
+        if auth and not auth.lower().startswith("bearer "):
+            auth = f"Bearer {auth}"
+
+        dev_id = token.device_id or str(uuid.uuid4())
+
+        return {
+            "client-id": self.APP_ID,
+            "client-name": "MY GENESIS",
+            "client-version": "1.0.5",
+            "client-os-code": "AOS",
+            "client-os-version": "33",
+            "accept-language": "en-GB",
+            "locale": "GB",
+            "timezone": "Z",
+            "app-request-id": str(uuid.uuid4()),
+            "x-timestamp": str(int(time.time() * 1000)),
+            "x-fingerprint": hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest(),
+            "accept": "application/json",
+            "user-agent": "Ktor client",
+            "authorization": auth,
+            "exchangeable-token": exchangeable_token,
+            "non-ccs-token": non_ccs_token,
+            "authentication": id_token,
+            "ccsp-device-id": dev_id,
+            "Brand": "genesis",
+        }
+
+    def _exchange_ccs_token_genesis(self, token: Token) -> None:
+        if BRANDS[self.brand] != BRAND_GENESIS:
+            return
+        url = (
+            f"https://{self.BASE_DOMAIN}/domain/api/v1/auth/token-exchange?serviceType=CCS"
+        )
+        headers = self._get_genesis_cci_headers(token)
+        headers["client-version"] = "1.0.5"
+        headers["client-os-code"] = "AOS"
+        headers["client-os-version"] = "33"
+        response = requests.post(url, headers=headers, json={})
+        if response.status_code == 200:
+            data = response.json()
+            token.ccs_token = data.get("accessToken")
+            _LOGGER.debug(f"{DOMAIN} - Successfully exchanged Genesis CCS Token")
+        else:
+            _LOGGER.error(
+                f"{DOMAIN} - Failed to exchange Genesis CCS Token: {response.text}"
+            )
+
     def login(
         self,
         username: str,
         password: str,
         pin: str | None = None,
     ) -> Token:
+        # Support for encoded Genesis tokens
+        if password.startswith("G:"):
+            try:
+                encoded_data = password[2:]
+                token_data = json.loads(base64.b64decode(encoded_data).decode())
+
+                access_token = token_data.get("a")
+                if access_token and not access_token.lower().startswith("bearer "):
+                    access_token = f"Bearer {access_token}"
+
+                valid_until = dt.datetime.now(dt.UTC) + dt.timedelta(minutes=50)
+
+                device_id = token_data.get("device_id")
+                if not device_id:
+                    device_id = self._get_device_id(self._get_stamp())
+
+                token = Token(
+                    username=username,
+                    password=password,
+                    access_token=access_token,
+                    refresh_token=token_data.get("r"),
+                    device_id=device_id,
+                    valid_until=valid_until,
+                    pin=pin,
+                    cci_access_token=access_token,
+                    exchangeable_token=token_data.get("ea", ""),
+                    exchangeable_refresh_token=token_data.get("er", ""),
+                    non_ccs_token=token_data.get("nc", ""),
+                    non_ccs_refresh_token=token_data.get("nr", ""),
+                    id_token=token_data.get("it", ""),
+                )
+                self._exchange_ccs_token_genesis(token)
+                return token
+            except Exception as e:
+                _LOGGER.error(f"{DOMAIN} - Failed to decode Genesis token string: {e}")
+                raise AuthenticationError("Invalid Genesis token string") from e
+
+        # Support for raw JSON token strings
+        if password.startswith("{"):
+            try:
+                token_data = json.loads(password)
+                access_token = token_data.get("a") or token_data.get("accessToken")
+                if access_token and not access_token.lower().startswith("bearer "):
+                    access_token = f"Bearer {access_token}"
+
+                valid_until = dt.datetime.now(dt.UTC) + dt.timedelta(minutes=50)
+
+                device_id = token_data.get("device_id")
+                if not device_id:
+                    if BRANDS[self.brand] == BRAND_GENESIS:
+                        device_id = self._get_device_id(self._get_stamp())
+                    else:
+                        device_id = str(uuid.uuid4())
+
+                token = Token(
+                    username=username,
+                    password=password,
+                    access_token=access_token,
+                    refresh_token=token_data.get("r") or token_data.get("refreshToken"),
+                    device_id=device_id,
+                    valid_until=valid_until,
+                    pin=pin,
+                    cci_access_token=access_token,
+                    exchangeable_token=token_data.get("ea")
+                    or token_data.get("exchangeableAccessToken", ""),
+                    exchangeable_refresh_token=token_data.get("er")
+                    or token_data.get("exchangeableRefreshToken", ""),
+                    non_ccs_token=token_data.get("nc")
+                    or token_data.get("nonCcsToken", ""),
+                    non_ccs_refresh_token=token_data.get("nr")
+                    or token_data.get("nonCcsRefreshToken", ""),
+                    id_token=token_data.get("it") or token_data.get("idToken", ""),
+                )
+                if BRANDS[self.brand] == BRAND_GENESIS:
+                    self._exchange_ccs_token_genesis(token)
+                return token
+            except Exception as e:
+                _LOGGER.error(f"{DOMAIN} - Failed to parse token JSON: {e}")
+                raise AuthenticationError("Invalid token JSON") from e
+
         stamp = self._get_stamp()
         device_id = self._get_device_id(stamp)
         cookies = self._get_cookies()
@@ -487,11 +645,99 @@ class KiaUvoApiEU(ApiImplType1):
     def refresh_access_token(self, token: Token) -> Token:
         """Refresh access token using the stored refresh token.
 
+        EU Genesis: refresh via cci-api-eu/domain/api/v2/auth/token-refresh with
+        rolling connector session rotation and CCS token exchange.
         EU Hyundai/Kia (CCI flow): refresh the CCI token set via
         cci-api-eu/domain/api/v2/auth/token-refresh, then re-exchange the CCS
-        token. Legacy/Genesis: use the OAuth2 refresh_token grant. Falls back
+        token. Legacy: use the OAuth2 refresh_token grant. Falls back
         to full login if the refresh token is missing or the exchange fails.
         """
+        if BRANDS[self.brand] == BRAND_GENESIS and (
+            getattr(token, "exchangeable_token", None)
+            or getattr(token, "non_ccs_token", None)
+            or getattr(token, "id_token", None)
+        ):
+            url = f"https://{self.BASE_DOMAIN}/domain/api/v2/auth/token-refresh"
+            headers = self._get_genesis_cci_headers(token)
+            headers["authentication"] = getattr(token, "id_token", "") or ""
+
+            # Remove authorization headers as the token is expired and the API will reject the request with 401
+            headers.pop("authorization", None)
+            headers.pop("Authorization", None)
+
+            def strip_bearer(t: str) -> str:
+                if t and t.lower().startswith("bearer "):
+                    return t.split(" ", 1)[1]
+                return t or ""
+
+            payload = {
+                "accessToken": strip_bearer(token.access_token),
+                "refreshToken": strip_bearer(token.refresh_token),
+                "exchangeableAccessToken": strip_bearer(
+                    getattr(token, "exchangeable_token", "")
+                ),
+                "exchangeableRefreshToken": strip_bearer(
+                    getattr(token, "exchangeable_refresh_token", "")
+                ),
+                "nonCcsToken": strip_bearer(getattr(token, "non_ccs_token", "")),
+                "nonCcsRefreshToken": strip_bearer(
+                    getattr(token, "non_ccs_refresh_token", "")
+                ),
+            }
+
+            response = requests.post(url, headers=headers, json=payload)
+            if response.status_code != 200:
+                raise AuthenticationError(
+                    f"Failed to refresh Genesis token: {response.text}"
+                )
+
+            data = response.json()
+            token_type = data.get("tokenType", "Bearer").capitalize()
+
+            token.access_token = f"{token_type} {data['accessToken']}"
+            token.refresh_token = data.get("refreshToken", token.refresh_token)
+
+            # Genesis Session Rotation:
+            connector = data.get("connector") or {}
+            hmg = connector.get("hmgid1.0") or {}
+            oneid = connector.get("oneid") or {}
+
+            token.exchangeable_token = hmg.get(
+                "accessToken",
+                data.get(
+                    "exchangeableAccessToken",
+                    getattr(token, "exchangeable_token", ""),
+                ),
+            )
+            token.exchangeable_refresh_token = hmg.get(
+                "refreshToken",
+                data.get(
+                    "exchangeableRefreshToken",
+                    getattr(token, "exchangeable_refresh_token", ""),
+                ),
+            )
+
+            token.non_ccs_token = oneid.get(
+                "accessToken",
+                data.get("nonCcsToken", getattr(token, "non_ccs_token", "")),
+            )
+            token.non_ccs_refresh_token = oneid.get(
+                "refreshToken",
+                data.get(
+                    "nonCcsRefreshToken", getattr(token, "non_ccs_refresh_token", "")
+                ),
+            )
+            token.id_token = data.get("idToken", getattr(token, "id_token", ""))
+
+            expires_in = data.get("expiresTime", data.get("expiresIn", 3599))
+            if expires_in > 600:
+                expires_in -= 600
+            token.valid_until = dt.datetime.now(dt.UTC) + dt.timedelta(
+                seconds=expires_in
+            )
+            self._exchange_ccs_token_genesis(token)
+            return token
+
         if getattr(token, "cci_access_token", None) or getattr(
             token, "non_ccs_token", None
         ):
@@ -1401,3 +1647,148 @@ class KiaUvoApiEU(ApiImplType1):
         authorization_code = response_json.get("refresh_token", authorization_code)
         expires_in = response_json["expires_in"]
         return token_type, access_token, authorization_code, expires_in
+
+    def test_token(self, token: Token) -> bool:
+        if BRANDS[self.brand] == BRAND_GENESIS:
+            url = f"https://{self.BASE_DOMAIN}/domain/api/v1/vehicle/available-vehicles?detail=true"
+            try:
+                response = requests.get(
+                    url, headers=self._get_genesis_cci_headers(token)
+                )
+                if response.status_code != 200:
+                    return False
+                try:
+                    data = response.json()
+                    if isinstance(data, dict) and data.get("code") == 9030:
+                        return False
+                except Exception:
+                    pass
+                return True
+            except Exception:
+                return False
+        return super().test_token(token)
+
+    def get_vehicles(self, token: Token) -> list[Vehicle]:
+        if BRANDS[self.brand] == BRAND_GENESIS:
+            url = f"https://{self.BASE_DOMAIN}/domain/api/v1/vehicle/available-vehicles?detail=true"
+            response = requests.get(
+                url, headers=self._get_genesis_cci_headers(token)
+            )
+            if response.status_code != 200:
+                raise APIError(
+                    f"Failed to get vehicles: {response.status_code} {response.text}"
+                )
+
+            data = response.json()
+            result = []
+            for entry in data.get("contents", []):
+                ccsp = entry.get("ccspVehicle", {})
+                car_type = ccsp.get("carType", "")
+
+                entry_engine_type = None
+                if car_type == "GN":
+                    entry_engine_type = ENGINE_TYPES.ICE
+                elif car_type == "EV":
+                    entry_engine_type = ENGINE_TYPES.EV
+                elif car_type == "PHEV":
+                    entry_engine_type = ENGINE_TYPES.PHEV
+                elif car_type == "HEV":
+                    entry_engine_type = ENGINE_TYPES.HEV
+
+                vehicle = Vehicle(
+                    id=entry.get("ccspCarId"),
+                    name=entry.get("vehicleNameView"),
+                    model=entry.get("vehicleModelName"),
+                    registration_date=ccsp.get("createdAt", ""),
+                    year=ccsp.get("detailInfo", {}).get("saleSpecYearCd", ""),
+                    VIN=entry.get("vin"),
+                    engine_type=entry_engine_type,
+                    ccu_ccs2_protocol_support=0,
+                )
+                result.append(vehicle)
+            return result
+        return super().get_vehicles(token)
+
+    def _get_authenticated_headers(
+        self, token: Token, ccs2_support: int | None = None
+    ) -> dict:
+        if BRANDS[self.brand] == BRAND_GENESIS:
+            if not getattr(token, "ccs_token", None):
+                self._exchange_ccs_token_genesis(token)
+            auth_token = getattr(token, "ccs_token", None) or token.access_token
+            if auth_token and not auth_token.lower().startswith("bearer "):
+                auth_token = f"Bearer {auth_token}"
+            if not getattr(token, "device_id", None):
+                token.device_id = self._get_device_id(self._get_stamp())
+            return {
+                "Authorization": auth_token,
+                "ccsp-service-id": self.LEGACY_CCSP_SERVICE_ID,
+                "ccsp-application-id": self.LEGACY_APP_ID,
+                "ccsp-device-id": token.device_id,
+                "Stamp": self._get_stamp(),
+                "Host": f"{self.LEGACY_DOMAIN}:{self.PORT}",
+                "Connection": "Keep-Alive",
+                "Accept-Encoding": "gzip",
+                "Ccuccs2protocolsupport": str(ccs2_support or 0),
+                "User-Agent": USER_AGENT_OK_HTTP,
+                "Content-Type": "application/json;charset=UTF-8",
+            }
+        return super()._get_authenticated_headers(token, ccs2_support)
+
+    def _get_stamp(self) -> str:
+        app_id = (
+            self.LEGACY_APP_ID
+            if BRANDS[self.brand] == BRAND_GENESIS
+            else self.APP_ID
+        )
+        raw_data = f"{app_id}:{int(dt.datetime.now().timestamp())}".encode()
+        result = bytes(b1 ^ b2 for b1, b2 in zip(self.CFB, raw_data))
+        return base64.b64encode(result).decode("utf-8")
+
+    def _get_device_id(self, stamp: str):
+        if BRANDS[self.brand] == BRAND_GENESIS:
+            my_hex = f"{random.randrange(10**80):064x}"
+            registration_id = my_hex[:64]
+            url = self.SPA_API_URL + "notifications/register"
+            payload = {
+                "pushRegId": registration_id,
+                "pushType": self.PUSH_TYPE,
+                "uuid": str(uuid.uuid4()),
+            }
+            headers = {
+                "ccsp-service-id": self.LEGACY_CCSP_SERVICE_ID,
+                "ccsp-application-id": self.LEGACY_APP_ID,
+                "Stamp": stamp,
+                "Content-Type": "application/json;charset=UTF-8",
+                "Host": f"{self.LEGACY_DOMAIN}:{self.PORT}",
+                "Connection": "Keep-Alive",
+                "Accept-Encoding": "gzip",
+                "User-Agent": USER_AGENT_OK_HTTP,
+            }
+            _LOGGER.debug(
+                f"{DOMAIN} - Genesis Get Device ID request: {url} {headers} {payload}"
+            )
+            response = requests.post(url, headers=headers, json=payload)
+            response = response.json()
+            _check_response_for_errors(response)
+            _LOGGER.debug(f"{DOMAIN} - Genesis Get Device ID response: {response}")
+            return response["resMsg"]["deviceId"]
+        return super()._get_device_id(stamp)
+
+    def _get_control_headers(self, token: Token, vehicle: Vehicle) -> dict:
+        if BRANDS[self.brand] == BRAND_GENESIS:
+            return self._get_authenticated_headers(
+                token, vehicle.ccu_ccs2_protocol_support
+            )
+        return super()._get_control_headers(token, vehicle)
+
+    def _get_api_headers(
+        self, token: Token, vehicle: Vehicle, is_write: bool = False
+    ) -> dict:
+        if BRANDS[self.brand] == BRAND_GENESIS:
+            return self._get_control_headers(token, vehicle)
+        if is_write:
+            return self._get_control_headers(token, vehicle)
+        return self._get_authenticated_headers(
+            token, vehicle.ccu_ccs2_protocol_support
+        )
