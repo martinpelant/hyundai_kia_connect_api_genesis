@@ -8,7 +8,6 @@ import pytest
 
 from hyundai_kia_connect_api.KiaUvoApiEU import KiaUvoApiEU
 from hyundai_kia_connect_api.Vehicle import Vehicle
-
 from tests.fixture_helpers import (
     discover_fixtures,
     get_fixture_expected,
@@ -16,7 +15,10 @@ from tests.fixture_helpers import (
     load_fixture,
 )
 
-EU_FIXTURE_FILES = discover_fixtures("eu_kia_ev6_")
+# CCS2 fixtures (eu_kia_ev6_2024_ccs2_*) use the newer protocol shape and are
+# covered by tests/test_ccs2_vehicle_properties.py; exclude them here so the
+# legacy EU parser is only tested against fixtures it actually understands.
+EU_FIXTURE_FILES = [f for f in discover_fixtures("eu_kia_ev6_") if "ccs2" not in f]
 
 
 @pytest.fixture
@@ -82,3 +84,13 @@ class TestEUUpdateVehicleProperties:
         data = load_fixture(fixture_file)
         eu_api._update_vehicle_properties(vehicle, data)
         assert vehicle.data is data
+
+
+def test_ev_timers_unset_when_api_returns_zero(eu_api, vehicle):
+    """issue #1206: '0000' means no scheduled timer -> None, no crash."""
+    data = load_fixture("eu_kia_ev6_unset_timers.json")
+    eu_api._update_vehicle_properties(vehicle, data)
+    assert vehicle.ev_first_departure_time is None
+    assert vehicle.ev_second_departure_time is None
+    assert vehicle.ev_off_peak_start_time is None
+    assert vehicle.ev_off_peak_end_time is None

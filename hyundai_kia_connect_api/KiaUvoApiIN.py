@@ -1,23 +1,22 @@
 """KiaUvoApiIN.py"""
 
-# pylint:disable=missing-timeout,missing-class-docstring,missing-function-docstring,wildcard-import,unused-wildcard-import,invalid-name,logging-fstring-interpolation,broad-except,bare-except,super-init-not-called,unused-argument,line-too-long,too-many-lines
+# pylint:disable=missing-class-docstring,missing-function-docstring,wildcard-import,unused-wildcard-import,invalid-name,logging-fstring-interpolation,broad-except,bare-except,unused-argument,line-too-long,too-many-lines
 
 import base64
 import datetime as dt
 import logging
 import math
-import random
 import re
+import time
 import typing as ty
-import uuid
-from typing import Optional
-from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
-import requests
-
-from .ApiImpl import ClimateRequestOptions
-from .ApiImplType1 import ApiImplType1, _check_response_for_errors
+from .ApiImpl import ApiImplSession, ClimateRequestOptions
+from .ApiImplType1 import (
+    ApiImplType1,
+    _check_response_for_errors,
+    _retry_on_device_id_error,
+)
 from .const import (
     BRAND_HYUNDAI,
     BRAND_KIA,
@@ -28,16 +27,13 @@ from .const import (
     ENGINE_TYPES,
     SEAT_STATUS,
     TEMPERATURE_UNITS,
-    VALET_MODE_ACTION,
     VEHICLE_LOCK_ACTION,
 )
 from .exceptions import AuthenticationError
 from .Token import Token
 from .utils import get_child_value, get_hex_temp_into_index, get_index_into_hex_temp
 from .Vehicle import (
-    DailyDrivingStats,
     DayTripCounts,
-    DayTripInfo,
     MonthTripInfo,
     TripInfo,
     Vehicle,
@@ -46,8 +42,8 @@ from .Vehicle import (
 _LOGGER = logging.getLogger(__name__)
 
 USER_AGENT_OK_HTTP: str = "okhttp/3.12.0"
-USER_AGENT_MOZILLA: str = "Mozilla/5.0 (Linux; Android 4.1.1; Galaxy Nexus Build/JRO03C) AppleWebKit/535.19 (KHTML, like Gecko) Chrome/18.0.1025.166 Mobile Safari/535.19"  # noqa
-ACCEPT_HEADER_ALL: str = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9"  # noqa
+USER_AGENT_MOZILLA: str = "Mozilla/5.0 (Linux; Android 4.1.1; Galaxy Nexus Build/JRO03C) AppleWebKit/535.19 (KHTML, like Gecko) Chrome/18.0.1025.166 Mobile Safari/535.19"
+ACCEPT_HEADER_ALL: str = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9"
 
 SUPPORTED_LANGUAGES_LIST = [
     "en",  # English
@@ -70,7 +66,7 @@ SUPPORTED_LANGUAGES_LIST = [
 
 class KiaUvoApiIN(ApiImplType1):
     data_timezone = ZoneInfo("Asia/Kolkata")
-    temperature_range = [x * 0.5 for x in range(28, 60)]
+    temperature_range = tuple(x * 0.5 for x in range(28, 60))
 
     def __init__(self, brand: int) -> None:
         # Strip language variants (e.g. en-Gb)
@@ -85,7 +81,7 @@ class KiaUvoApiIN(ApiImplType1):
             self.CFB: str = base64.b64decode(
                 "RFtoRq/vDXJmRndoZaZQyfOot7OrIqGVFj96iY2WL3yyH5Z/pUvlUhqmCxD2t+D65SQ="
             )
-            self.BASIC_AUTHORIZATION: str = "Basic ZTViM2Y2ZDAtN2Y4My00M2M5LWFmZjMtYTI1NGRiN2FmMzY4OjVKRk9DcjZDMjRPZk96bERxWnA3RXdxcmtMMFd3MDRVYXhjRGlFNlVkM3FJNVNFNA=="  # noqa
+            self.BASIC_AUTHORIZATION: str = "Basic ZTViM2Y2ZDAtN2Y4My00M2M5LWFmZjMtYTI1NGRiN2FmMzY4OjVKRk9DcjZDMjRPZk96bERxWnA3RXdxcmtMMFd3MDRVYXhjRGlFNlVkM3FJNVNFNA=="
             self.LOGIN_FORM_HOST = "prd.in-ccapi.hyundai.connected-car.io"
             self.PUSH_TYPE = "GCM"
         elif BRANDS[brand] == BRAND_KIA:
@@ -96,7 +92,7 @@ class KiaUvoApiIN(ApiImplType1):
             self.CFB: str = base64.b64decode(
                 "pdfn/jCrrEcxH6Jnak/1O/DaD+HjVh0P6z/BHWNoUKQtT0aLcYwer8BxQOoiHXSyMtBV"
             )
-            self.BASIC_AUTHORIZATION: str = "Basic ZDBmZTQ4NTUtNzUyNy00YmUwLWFiNmUtYTQ4MTIxNmM3MDVkOlNIb1R0WHB5ZmJZbVAzWGpOQTZCcnRsRGdseXBQV2o5MjBQdEtCSlBmbGVIRVlwVQ=="  # noqa
+            self.BASIC_AUTHORIZATION: str = "Basic ZDBmZTQ4NTUtNzUyNy00YmUwLWFiNmUtYTQ4MTIxNmM3MDVkOlNIb1R0WHB5ZmJZbVAzWGpOQTZCcnRsRGdseXBQV2o5MjBQdEtCSlBmbGVIRVlwVQ=="
             self.LOGIN_FORM_HOST = "prd.in-ccapi.kia.connected-car.io"
             self.PUSH_TYPE = "APNS"
 
@@ -109,7 +105,7 @@ class KiaUvoApiIN(ApiImplType1):
         self.CLIENT_ID: str = self.CCSP_SERVICE_ID
 
     def _get_authenticated_headers(
-        self, token: Token, ccs2_support: Optional[int] = None
+        self, token: Token, ccs2_support: int | None = None
     ) -> dict:
         return {
             "Authorization": token.access_token,
@@ -147,7 +143,7 @@ class KiaUvoApiIN(ApiImplType1):
             stamp, authorization_code
         )
         _, refresh_token = self._get_refresh_token(stamp, authorization_code)
-        valid_until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=23)
+        valid_until = dt.datetime.now(dt.UTC) + dt.timedelta(hours=23)
 
         return Token(
             username=username,
@@ -158,54 +154,6 @@ class KiaUvoApiIN(ApiImplType1):
             valid_until=valid_until,
             pin=pin,
         )
-
-    def get_vehicles(self, token: Token) -> list[Vehicle]:
-        url = self.SPA_API_URL + "vehicles"
-        response = requests.get(
-            url,
-            headers=self._get_authenticated_headers(token),
-        ).json()
-        _LOGGER.debug(f"{DOMAIN} - Get Vehicles Response: {response}")
-        _check_response_for_errors(response)
-        result = []
-        for entry in response["resMsg"]["vehicles"]:
-            entry_engine_type = None
-            if entry["type"] == "GN":
-                entry_engine_type = ENGINE_TYPES.ICE
-            elif entry["type"] == "EV":
-                entry_engine_type = ENGINE_TYPES.EV
-            elif entry["type"] == "PHEV":
-                entry_engine_type = ENGINE_TYPES.PHEV
-            elif entry["type"] == "HV":
-                entry_engine_type = ENGINE_TYPES.HEV
-            elif entry["type"] == "PE":
-                entry_engine_type = ENGINE_TYPES.PHEV
-            vehicle: Vehicle = Vehicle(
-                id=entry["vehicleId"],
-                name=entry["nickname"],
-                model=entry["vehicleName"],
-                registration_date=entry["regDate"],
-                VIN=entry["vin"],
-                timezone=self.data_timezone,
-                engine_type=entry_engine_type,
-                ccu_ccs2_protocol_support=entry["ccuCCS2ProtocolSupport"],
-            )
-            result.append(vehicle)
-        return result
-
-    def _get_time_from_string(self, value, timesection) -> dt.datetime.time:
-        if value is not None:
-            lastTwo = int(value[-2:])
-            if lastTwo > 60:
-                value = int(value) + 40
-            if int(value) > 1260:
-                value = dt.datetime.strptime(str(value), "%H%M").time()
-            else:
-                d = dt.datetime.strptime(str(value), "%I%M")
-                if timesection > 0:
-                    d += dt.timedelta(hours=12)
-                value = d.time()
-        return value
 
     def update_vehicle_with_cached_state(self, token: Token, vehicle: Vehicle) -> None:
         state = self._get_cached_vehicle_state(token, vehicle)
@@ -220,6 +168,10 @@ class KiaUvoApiIN(ApiImplType1):
 
         self._update_vehicle_location(vehicle, state)
 
+        if vehicle.engine_type == ENGINE_TYPES.EV:
+            charge = self._get_charge_limits(token, vehicle)
+            self._update_vehicle_properties_charge(vehicle, charge)
+
     def _update_vehicle_maintenance_alert(self, vehicle: Vehicle, state: dict) -> None:
         if get_child_value(state, "odometer"):
             vehicle.odometer = (get_child_value(state, "odometer"), DISTANCE_UNITS[1])
@@ -227,7 +179,7 @@ class KiaUvoApiIN(ApiImplType1):
     def _get_maintenance_alert(self, token: Token, vehicle: Vehicle) -> dict:
         url = self.SPA_API_URL + "vehicles/" + vehicle.id + "/setting/alert/maintenance"
         _LOGGER.error(f"Getting maintenance alert from {url}")
-        response = requests.get(
+        response = self.session.get(
             url, headers=self._get_authenticated_headers(token)
         ).json()
         _LOGGER.error(response)
@@ -243,9 +195,13 @@ class KiaUvoApiIN(ApiImplType1):
             )
 
     def force_refresh_vehicle_state(self, token: Token, vehicle: Vehicle) -> None:
-        state = self._get_forced_vehicle_state(token, vehicle)
-        state["vehicleLocation"] = self._get_location(token, vehicle)
-        self._update_vehicle_properties(vehicle, state)
+        is_ccs2 = vehicle.ccu_ccs2_protocol_support != 0
+        if is_ccs2:
+            self._force_refresh_vehicle_state_ccs2(token, vehicle)
+        else:
+            state = self._get_forced_vehicle_state(token, vehicle)
+            state["vehicleLocation"] = self._get_location(token, vehicle)
+            self._update_vehicle_properties(vehicle, state)
         # Only call for driving info on cars we know have a chance of supporting it.
         # Could be expanded if other types do support it.
         if (
@@ -253,6 +209,9 @@ class KiaUvoApiIN(ApiImplType1):
             or vehicle.engine_type == ENGINE_TYPES.PHEV
         ):
             try:
+                charge = self._get_charge_limits(token, vehicle)
+                self._update_vehicle_properties_charge(vehicle, charge)
+
                 state = self._get_driving_info(token, vehicle)
             except Exception as e:
                 # we don't know if all car types provide this information.
@@ -267,6 +226,23 @@ class KiaUvoApiIN(ApiImplType1):
                 )
             else:
                 self._update_vehicle_drive_info(vehicle, state)
+
+    def _force_refresh_vehicle_state_ccs2(self, token: Token, vehicle: Vehicle) -> None:
+        url = self.SPA_API_URL + "vehicles/" + vehicle.id + "/ccs2/carstatus"
+        response = self.session.get(
+            url,
+            headers=self._get_authenticated_headers(
+                token, vehicle.ccu_ccs2_protocol_support
+            ),
+        ).json()
+        _LOGGER.debug(
+            f"{DOMAIN} - Force refresh CCS2 vehicle status response: {response}"
+        )
+        _check_response_for_errors(response)
+        state = response["resMsg"]
+        self._update_vehicle_properties(vehicle, state)
+        location = self._get_location(token, vehicle)
+        self._update_vehicle_location(vehicle, location)
 
     def _update_vehicle_properties(self, vehicle: Vehicle, state: dict) -> None:
         if get_child_value(state, "time"):
@@ -300,18 +276,18 @@ class KiaUvoApiIN(ApiImplType1):
             vehicle.steering_wheel_heater_is_on = True
 
         vehicle.back_window_heater_is_on = get_child_value(state, "sideBackWindowHeat")
-        vehicle.front_left_seat_status = SEAT_STATUS[
+        vehicle.front_left_seat_status = SEAT_STATUS.get(
             get_child_value(state, "seatHeaterVentState.astSeatHeatState")
-        ]
-        vehicle.front_right_seat_status = SEAT_STATUS[
+        )
+        vehicle.front_right_seat_status = SEAT_STATUS.get(
             get_child_value(state, "seatHeaterVentState.drvSeatHeatState")
-        ]
-        vehicle.rear_left_seat_status = SEAT_STATUS[
+        )
+        vehicle.rear_left_seat_status = SEAT_STATUS.get(
             get_child_value(state, "seatHeaterVentState.rlSeatHeatState")
-        ]
-        vehicle.rear_right_seat_status = SEAT_STATUS[
+        )
+        vehicle.rear_right_seat_status = SEAT_STATUS.get(
             get_child_value(state, "seatHeaterVentState.rrSeatHeatState")
-        ]
+        )
         vehicle.is_locked = get_child_value(state, "doorLock")
         vehicle.front_left_door_is_open = get_child_value(state, "doorOpen.frontLeft")
         vehicle.front_right_door_is_open = get_child_value(state, "doorOpen.frontRight")
@@ -369,6 +345,18 @@ class KiaUvoApiIN(ApiImplType1):
         )
         vehicle.headlamp_right_low = bool(
             get_child_value(state, "lampWireStatus.headLamp.rightLowLamp")
+        )
+        vehicle.headlamp_left_high = bool(
+            get_child_value(state, "lampWireStatus.headLamp.leftHighLamp")
+        )
+        vehicle.headlamp_right_high = bool(
+            get_child_value(state, "lampWireStatus.headLamp.rightHighLamp")
+        )
+        vehicle.headlamp_left_bifunc = bool(
+            get_child_value(state, "lampWireStatus.headLamp.leftBifuncLamp")
+        )
+        vehicle.headlamp_right_bifunc = bool(
+            get_child_value(state, "lampWireStatus.headLamp.rightBifuncLamp")
         )
         vehicle.stop_lamp_left = bool(
             get_child_value(state, "lampWireStatus.stopLamp.leftLamp")
@@ -473,19 +461,13 @@ class KiaUvoApiIN(ApiImplType1):
 
         vehicle.data = state
 
-    def _update_vehicle_drive_info(self, vehicle: Vehicle, state: dict) -> None:
-        vehicle.total_power_consumed = get_child_value(state, "totalPwrCsp")
-        vehicle.total_power_regenerated = get_child_value(state, "regenPwr")
-        vehicle.power_consumption_30d = get_child_value(state, "consumption30d")
-        vehicle.daily_stats = get_child_value(state, "dailyStats")
-
     def _get_cached_vehicle_state(self, token: Token, vehicle: Vehicle) -> dict:
         url = self.SPA_API_URL + "vehicles/" + vehicle.id
         if vehicle.ccu_ccs2_protocol_support == 0:
             url = url + "/status/latest"
         else:
             url = url + "/ccs2/carstatus/latest"
-        response = requests.get(
+        response = self.session.get(
             url,
             headers=self._get_authenticated_headers(
                 token, vehicle.ccu_ccs2_protocol_support
@@ -501,7 +483,7 @@ class KiaUvoApiIN(ApiImplType1):
         _LOGGER.error(f"Getting location from {url}")
 
         try:
-            response = requests.get(
+            response = self.session.get(
                 url,
                 headers=self._get_authenticated_headers(
                     token, vehicle.ccu_ccs2_protocol_support
@@ -521,27 +503,14 @@ class KiaUvoApiIN(ApiImplType1):
 
         payload = {"action": action.value, "deviceId": token.device_id}
         _LOGGER.debug(f"{DOMAIN} - Lock Action Request: {payload}")
-        response = requests.post(
+        response = self.session.post(
             url, json=payload, headers=self._get_authenticated_headers(token)
         ).json()
         _LOGGER.debug(f"{DOMAIN} - Lock Action Response: {response}")
         _check_response_for_errors(response)
         return response["msgId"]
 
-    def _get_forced_vehicle_state(self, token: Token, vehicle: Vehicle) -> dict:
-        url = self.SPA_API_URL + "vehicles/" + vehicle.id + "/status"
-        response = requests.get(
-            url,
-            headers=self._get_authenticated_headers(
-                token, vehicle.ccu_ccs2_protocol_support
-            ),
-        ).json()
-        _LOGGER.debug(f"{DOMAIN} - Received forced vehicle data: {response}")
-        _check_response_for_errors(response)
-        mapped_response = {}
-        mapped_response["vehicleStatus"] = response["resMsg"]
-        return mapped_response
-
+    @_retry_on_device_id_error
     def charge_port_action(
         self, token: Token, vehicle: Vehicle, action: CHARGE_PORT_ACTION
     ) -> str:
@@ -549,12 +518,11 @@ class KiaUvoApiIN(ApiImplType1):
 
         payload = {"action": action.value, "deviceID": token.device_id}
         _LOGGER.debug(f"{DOMAIN} - Charge Port Action Request: {payload}")
-        response = requests.post(
+        response = self.session.post(
             url, json=payload, headers=self._get_control_headers(token, vehicle)
         ).json()
         _LOGGER.debug(f"{DOMAIN} - Charge Port Action Response: {response}")
         _check_response_for_errors(response)
-        token.device_id = self._get_device_id(self._get_stamp())
         return response["msgId"]
 
     def start_climate(
@@ -585,12 +553,13 @@ class KiaUvoApiIN(ApiImplType1):
             "options": {
                 "defrost": options.defrost,
                 "heating1": int(options.heating),
+                "igniOnDuration": options.duration,
             },
             "tempCode": hex_set_temp,
             "unit": "C",
         }
         _LOGGER.debug(f"{DOMAIN} - Start Climate Action Request: {payload}")
-        response = requests.post(
+        response = self.session.post(
             url, json=payload, headers=self._get_authenticated_headers(token)
         ).json()
         _LOGGER.debug(f"{DOMAIN} - Start Climate Action Response: {response}")
@@ -603,88 +572,53 @@ class KiaUvoApiIN(ApiImplType1):
             "action": "stop",
         }
         _LOGGER.debug(f"{DOMAIN} - Stop Climate Action Request: {payload}")
-        response = requests.post(
+        response = self.session.post(
             url, json=payload, headers=self._get_control_headers(token, vehicle)
         ).json()
         _LOGGER.debug(f"{DOMAIN} - Stop Climate Action Response: {response}")
         _check_response_for_errors(response)
         return response["msgId"]
 
+    @_retry_on_device_id_error
     def start_hazard_lights(self, token: Token, vehicle: Vehicle) -> str:
         url = self.SPA_API_URL_V2 + "vehicles/" + vehicle.id + "/ccs2/control/light"
 
         payload = {"command": "on"}
         _LOGGER.debug(f"{DOMAIN} - Start Hazard Lights Request: {payload}")
-        response = requests.post(
+        response = self.session.post(
             url,
             json=payload,
             headers=self._get_control_headers(token, vehicle),
         ).json()
         _LOGGER.debug(f"{DOMAIN} - Start Hazard Lights Response: {response}")
         _check_response_for_errors(response)
-        token.device_id = self._get_device_id(self._get_stamp())
         return response["msgId"]
 
+    @_retry_on_device_id_error
     def start_hazard_lights_and_horn(self, token: Token, vehicle: Vehicle) -> str:
         url = self.SPA_API_URL_V2 + "vehicles/" + vehicle.id + "/ccs2/control/hornlight"
 
         payload = {"command": "on"}
         _LOGGER.debug(f"{DOMAIN} - Start Hazard Lights and Horn Request: {payload}")
-        response = requests.post(
+        response = self.session.post(
             url,
             json=payload,
             headers=self._get_control_headers(token, vehicle),
         ).json()
         _LOGGER.debug(f"{DOMAIN} - Start Hazard Lights and Horn Response: {response}")
         _check_response_for_errors(response)
-        token.device_id = self._get_device_id(self._get_stamp())
         return response["msgId"]
 
-    def _get_charge_limits(self, token: Token, vehicle: Vehicle) -> dict:
-        # Not currently used as value is in the general get.
-        # Most likely this forces the car the update it.
-        url = f"{self.SPA_API_URL}vehicles/{vehicle.id}/charge/target"
-
-        _LOGGER.debug(f"{DOMAIN} - Get Charging Limits Request")
-        response = requests.get(
-            url,
-            headers=self._get_authenticated_headers(
-                token, vehicle.ccu_ccs2_protocol_support
-            ),
-        ).json()
-        _LOGGER.debug(f"{DOMAIN} - Get Charging Limits Response: {response}")
-        _check_response_for_errors(response)
-        # API sometimes returns multiple entries per plug type and they conflict.
-        # The car itself says the last entry per plug type is the truth when tested
-        # (EU Ioniq Electric Facelift MY 2019)
-        if response["resMsg"] is not None:
-            return response["resMsg"]
-
-    def _get_trip_info(
-        self,
-        token: Token,
-        vehicle: Vehicle,
-        date_string: str,
-        trip_period_type: int,
-    ) -> dict:
-        url = self.SPA_API_URL + "vehicles/" + vehicle.id + "/tripinfo"
-        if trip_period_type == 0:  # month
-            payload = {"tripPeriodType": 0, "setTripMonth": date_string}
-        else:
-            payload = {"tripPeriodType": 1, "setTripDay": date_string}
-
-        _LOGGER.debug(f"{DOMAIN} - get_trip_info Request {payload}")
-        response = requests.post(
-            url,
-            json=payload,
-            headers=self._get_authenticated_headers(
-                token, vehicle.ccu_ccs2_protocol_support
-            ),
-        )
-        response = response.json()
-        _LOGGER.debug(f"{DOMAIN} - get_trip_info response {response}")
-        _check_response_for_errors(response)
-        return response
+    def _update_vehicle_properties_charge(self, vehicle: Vehicle, state: dict) -> None:
+        try:
+            if isinstance(state.get("targetSOClist"), list):
+                for item in state["targetSOClist"]:
+                    if item["plugType"] == 0:
+                        vehicle.ev_charge_limits_dc = item["targetSOClevel"]
+                    elif item["plugType"] == 1:
+                        vehicle.ev_charge_limits_ac = item["targetSOClevel"]
+        except Exception:
+            _LOGGER.debug(f"{DOMAIN} - SOC Levels couldn't be found. May not be an EV.")
 
     # The "/tripinfo" API in Bluelink India does not provide complete trip info. It just returns the summary info. Instead, it uses the "/tripinfo/detail" API to fetch the trip details.
     # PS: Since I have tested in Hyundai EV vehicle only, have added check to use the API only for EV vehicles. Can remove the check based on testing on non-EV vehicles
@@ -710,7 +644,7 @@ class KiaUvoApiIN(ApiImplType1):
             "tripStartTime": trip["tripStartTime"],
             "tripEndTime": trip["tripEndTime"],
         }
-        response = requests.post(
+        response = self.session.post(
             url,
             json=payload,
             headers=self._get_authenticated_headers(
@@ -774,185 +708,17 @@ class KiaUvoApiIN(ApiImplType1):
 
             vehicle.month_trip_info = result
 
-    def update_day_trip_info(
-        self,
-        token,
-        vehicle,
-        yyyymmdd_string,
-    ) -> None:
-        """
-        feature only available for some regions.
-        Updates the vehicle.day_trip_info information for the specified day.
+    def _get_drv_seat_loc(self, vehicle: Vehicle) -> str:
+        """India uses RHD vehicles regardless of the odometer unit."""
+        return "R"
 
-        Default this information is None:
-
-        day_trip_info: DayTripInfo = None
-        """
-        vehicle.day_trip_info = None
-        json_result = self._get_trip_info(
-            token,
-            vehicle,
-            yyyymmdd_string,
-            1,  # day trip info
-        )
-        day_trip_list = json_result["resMsg"]["dayTripList"]
-        if len(day_trip_list) > 0:
-            msg = day_trip_list[0]
-            result = DayTripInfo(
-                yyyymmdd=yyyymmdd_string,
-                trip_list=[],
-                summary=TripInfo(
-                    drive_time=msg["tripDrvTime"],
-                    idle_time=msg["tripIdleTime"],
-                    distance=msg["tripDist"],
-                    avg_speed=msg["tripAvgSpeed"],
-                    max_speed=msg["tripMaxSpeed"],
-                ),
-            )
-            for trip in msg["tripList"]:
-                # Hyundai EVs do not provide full trip info. Used "/tripinfo/detail" API instead
-                if "tripTime" in trip:
-                    processed_trip = TripInfo(
-                        hhmmss=trip["tripTime"],
-                        drive_time=trip["tripDrvTime"],
-                        idle_time=trip["tripIdleTime"],
-                        distance=trip["tripDist"],
-                        avg_speed=trip["tripAvgSpeed"],
-                        max_speed=trip["tripMaxSpeed"],
-                    )
-                else:
-                    processed_trip = self._get_detailed_trip_info(
-                        token, vehicle, yyyymmdd_string, trip
-                    )
-
-                result.trip_list.append(processed_trip)
-
-            vehicle.day_trip_info = result
-
-    def _get_driving_info(self, token: Token, vehicle: Vehicle) -> dict:
-        url = self.SPA_API_URL + "vehicles/" + vehicle.id + "/drvhistory"
-
-        responseAlltime = requests.post(
-            url,
-            json={"periodTarget": 1},
-            headers=self._get_authenticated_headers(
-                token, vehicle.ccu_ccs2_protocol_support
-            ),
-        )
-        responseAlltime = responseAlltime.json()
-        _LOGGER.debug(f"{DOMAIN} - get_driving_info responseAlltime {responseAlltime}")
-        _check_response_for_errors(responseAlltime)
-
-        response30d = requests.post(
-            url,
-            json={"periodTarget": 0},
-            headers=self._get_authenticated_headers(
-                token, vehicle.ccu_ccs2_protocol_support
-            ),
-        )
-        response30d = response30d.json()
-        _LOGGER.debug(f"{DOMAIN} - get_driving_info response30d {response30d}")
-        _check_response_for_errors(response30d)
-        if get_child_value(responseAlltime, "resMsg.drivingInfo.0"):
-            drivingInfo = responseAlltime["resMsg"]["drivingInfo"][0]
-
-            drivingInfo["dailyStats"] = []
-            if get_child_value(response30d, "resMsg.drivingInfoDetail.0"):
-                for day in response30d["resMsg"]["drivingInfoDetail"]:
-                    processedDay = DailyDrivingStats(
-                        date=dt.datetime.strptime(day["drivingDate"], "%Y%m%d"),
-                        total_consumed=get_child_value(day, "totalPwrCsp"),
-                        engine_consumption=get_child_value(day, "motorPwrCsp"),
-                        climate_consumption=get_child_value(day, "climatePwrCsp"),
-                        onboard_electronics_consumption=get_child_value(
-                            day, "eDPwrCsp"
-                        ),
-                        battery_care_consumption=get_child_value(
-                            day, "batteryMgPwrCsp"
-                        ),
-                        regenerated_energy=get_child_value(day, "regenPwr"),
-                        distance=get_child_value(day, "calculativeOdo"),
-                        distance_unit=vehicle.odometer_unit,
-                    )
-                    drivingInfo["dailyStats"].append(processedDay)
-
-            for drivingInfoItem in response30d["resMsg"]["drivingInfo"]:
-                if (
-                    drivingInfoItem["drivingPeriod"] == 0
-                    and next(
-                        (
-                            v
-                            for k, v in drivingInfoItem.items()
-                            if k.lower() == "calculativeodo"
-                        ),
-                        0,
-                    )
-                    > 0
-                ):
-                    drivingInfo["consumption30d"] = round(
-                        drivingInfoItem["totalPwrCsp"]
-                        / drivingInfoItem["calculativeOdo"]
-                    )
-                    break
-
-            return drivingInfo
-        else:
-            _LOGGER.debug(
-                f"{DOMAIN} - Driving info didn't return valid data. This may be normal if the car doesn't support it."  # noqa
-            )
-            return None
-
-    def valet_mode_action(
-        self, token: Token, vehicle: Vehicle, action: VALET_MODE_ACTION
-    ) -> str:
-        url = self.SPA_API_URL_V2 + "vehicles/" + vehicle.id + "/control/valet"
-
-        payload = {"action": action.value}
-        _LOGGER.debug(f"{DOMAIN} - Valet Mode Action Request: {payload}")
-        response = requests.post(
-            url, json=payload, headers=self._get_control_headers(token, vehicle)
-        ).json()
-        _LOGGER.debug(f"{DOMAIN} - Valet Mode Action Response: {response}")
-        _check_response_for_errors(response)
-        token.device_id = self._get_device_id(self._get_stamp())
-        return response["msgId"]
-
-    def _get_stamp(self) -> str:
-        raw_data = f"{self.APP_ID}:{int(dt.datetime.now().timestamp())}".encode()
-        result = bytes(b1 ^ b2 for b1, b2 in zip(self.CFB, raw_data))
-        return base64.b64encode(result).decode("utf-8")
-
-    def _get_device_id(self, stamp: str):
-        my_hex = "%064x" % random.randrange(  # pylint: disable=consider-using-f-string
-            10**80
-        )
-        registration_id = my_hex[:64]
-        url = self.SPA_API_URL + "notifications/register"
-        payload = {
-            "pushRegId": registration_id,
-            "pushType": self.PUSH_TYPE,
-            "uuid": str(uuid.uuid4()),
-        }
-
-        headers = {
-            "ccsp-service-id": self.CCSP_SERVICE_ID,
-            "ccsp-application-id": self.APP_ID,
-            "Stamp": stamp,
-            "Content-Type": "application/json;charset=UTF-8",
-            "Host": self.BASE_URL,
-            "Connection": "Keep-Alive",
-            "Accept-Encoding": "gzip",
-            "User-Agent": USER_AGENT_OK_HTTP,
-        }
-
-        _LOGGER.debug(f"{DOMAIN} - Get Device ID request: {url} {headers} {payload}")
-        response = requests.post(url, headers=headers, json=payload)
-        response = response.json()
-        _check_response_for_errors(response)
-        _LOGGER.debug(f"{DOMAIN} - Get Device ID response: {response}")
-
-        device_id = response["resMsg"]["deviceId"]
-        return device_id
+    def _parse_day_trip(
+        self, token: Token, vehicle: Vehicle, yyyymmdd_string: str, trip: dict
+    ) -> TripInfo:
+        # Hyundai EVs do not provide full trip info. Used "/tripinfo/detail" API instead
+        if "tripTime" in trip:
+            return super()._parse_day_trip(token, vehicle, yyyymmdd_string, trip)
+        return self._get_detailed_trip_info(token, vehicle, yyyymmdd_string, trip)
 
     def _get_cookies(self) -> dict:
         # Get Cookies #
@@ -966,25 +732,9 @@ class KiaUvoApiIN(ApiImplType1):
         )
 
         _LOGGER.debug(f"{DOMAIN} - Get cookies request: {url}")
-        session = requests.Session()
+        session = ApiImplSession()
         _ = session.get(url)
-        _LOGGER.debug(f"{DOMAIN} - Get cookies response: {session.cookies.get_dict()}")
         return session.cookies.get_dict()
-        # return session
-
-    def _get_authorization_code_with_redirect_url(
-        self, username, password, cookies
-    ) -> str:
-        url = self.USER_API_URL + "signin"
-        headers = {"Content-type": "application/json"}
-        data = {"email": username, "password": password}
-        response = requests.post(
-            url, json=data, headers=headers, cookies=cookies
-        ).json()
-        _LOGGER.debug(f"{DOMAIN} - Sign In Response: {response}")
-        parsed_url = urlparse(response["redirectUrl"])
-        authorization_code = "".join(parse_qs(parsed_url.query)["code"])
-        return authorization_code
 
     def _get_access_token(self, stamp, authorization_code):
         # Get Access Token #
@@ -1005,15 +755,12 @@ class KiaUvoApiIN(ApiImplType1):
             + "%3A8080%2Fapi%2Fv1%2Fuser%2Foauth2%2Fredirect&code="
             + authorization_code
         )
-        _LOGGER.debug(f"{DOMAIN} - Get Access Token Data: {headers}{data}")
-        response = requests.post(url, data=data, headers=headers)
+        response = self.session.post(url, data=data, headers=headers)
         response = response.json()
-        _LOGGER.debug(f"{DOMAIN} - Get Access Token Response: {response}")
 
         token_type = response["token_type"]
         access_token = token_type + " " + response["access_token"]
         authorization_code = response["refresh_token"]
-        _LOGGER.debug(f"{DOMAIN} - Access Token Value {access_token}")
         return token_type, access_token, authorization_code
 
     def get_last_updated_at(self, value) -> dt.datetime:
@@ -1049,18 +796,20 @@ class KiaUvoApiIN(ApiImplType1):
         }
 
         data = (
-            "grant_type=refresh_token&redirect_uri=https%3A%2F%2Fwww.getpostman.com%2Foauth2%2Fcallback&refresh_token="  # noqa
+            "grant_type=refresh_token&redirect_uri=https%3A%2F%2Fwww.getpostman.com%2Foauth2%2Fcallback&refresh_token="
             + authorization_code
         )
-        _LOGGER.debug(f"{DOMAIN} - Get Refresh Token Data: {data}")
-        response = requests.post(url, data=data, headers=headers)
+        response = self.session.post(url, data=data, headers=headers)
         response = response.json()
-        _LOGGER.debug(f"{DOMAIN} - Get Refresh Token Response: {response}")
         token_type = response["token_type"]
         refresh_token = token_type + " " + response["access_token"]
         return token_type, refresh_token
 
     def _get_control_token(self, token: Token) -> Token:
+        # Return cached control token if still valid
+        if token.control_token is not None and token.control_token_expiry > time.time():
+            return token.control_token, token.control_token_expiry
+
         url = self.USER_API_URL + "pin?token="
         headers = {
             "Authorization": token.access_token,
@@ -1071,12 +820,13 @@ class KiaUvoApiIN(ApiImplType1):
         }
 
         data = {"deviceId": token.device_id, "pin": token.pin}
-        _LOGGER.debug(f"{DOMAIN} - Get Control Token Data: {data}")
-        response = requests.put(url, json=data, headers=headers)
+        response = self.session.put(url, json=data, headers=headers)
         response = response.json()
-        _LOGGER.debug(f"{DOMAIN} - Get Control Token Response {response}")
         control_token = "Bearer " + response["controlToken"]
         control_token_expire_at = math.floor(
             dt.datetime.now().timestamp() + response["expiresTime"]
         )
+        # Cache control token and expiry for reuse
+        token.control_token = control_token
+        token.control_token_expiry = control_token_expire_at
         return control_token, control_token_expire_at

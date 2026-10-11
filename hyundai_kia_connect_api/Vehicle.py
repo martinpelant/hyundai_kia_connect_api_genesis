@@ -1,13 +1,12 @@
 # pylint:disable=missing-class-docstring,missing-function-docstring,wildcard-import,unused-wildcard-import,invalid-name,logging-fstring-interpolation
 """Vehicle class"""
 
-import logging
 import datetime
-import typing
+import logging
 from dataclasses import dataclass, field
 
-from .utils import get_float, get_safe_local_datetime
-from .const import DISTANCE_UNITS
+from .const import DISTANCE_UNITS, PRESSURE_UNITS, PressureUnit
+from .utils import float_or_none, get_float, get_safe_local_datetime
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -97,10 +96,11 @@ class Vehicle:
     engine_is_running: bool = None
 
     _last_updated_at: datetime.datetime = None
-    timezone: datetime.timezone = datetime.timezone.utc  # default UTC
+    _last_scanned_at: datetime.datetime = None
+    timezone: datetime.timezone = datetime.UTC  # default UTC
 
-    dtc_count: typing.Union[int, None] = None
-    dtc_descriptions: typing.Union[dict, None] = None
+    dtc_count: int | None = None
+    dtc_descriptions: dict | None = None
 
     smart_key_battery_warning_is_on: bool = None
     washer_fluid_warning_is_on: bool = None
@@ -144,6 +144,25 @@ class Vehicle:
     back_left_window_is_open: bool = None
     back_right_window_is_open: bool = None
     sunroof_is_open: bool = None
+    supports_window_control: bool = None
+    supports_valet_mode: bool = None
+
+    # Valet Status
+    valet_mode_active: bool = None
+
+    # SVM (Surround View Monitor / Find My Car) — USA Hyundai
+    supports_svm: bool | None = None
+
+    # Software version (GSPA device-info read)
+    software_version: str | None = None
+    ota_update_available: bool | None = None
+
+    # Cached-failure flags for GSPA query endpoints (reset by force refresh).
+    # _ota_checked: True after the first OTA check (no re-check until force
+    # refresh); _valet_failed: pessimistic circuit — True while a valet read
+    # is in flight or after a failure, reset to False on success.
+    _ota_checked: bool = False
+    _valet_failed: bool = False
 
     # Tire Pressure
     tire_pressure_all_warning_is_on: bool = None
@@ -151,6 +170,26 @@ class Vehicle:
     tire_pressure_front_left_warning_is_on: bool = None
     tire_pressure_front_right_warning_is_on: bool = None
     tire_pressure_rear_right_warning_is_on: bool = None
+    # Tire pressure values (CCS2 Chassis.Axle.*.Tire.Pressure). Model B: raw is
+    # in the car's display unit; value = raw x PRESSURE_SCALES[PressureUnit].
+    # See const.PRESSURE_UNITS / PRESSURE_SCALES. None when unreported.
+    tire_pressure_front_left: float = None
+    tire_pressure_front_right: float = None
+    tire_pressure_rear_left: float = None
+    tire_pressure_rear_right: float = None
+    # Tire-pressure display unit (PressureUnit IntEnum). Single source of truth;
+    # the per-tire *_unit properties below derive the label from this (no
+    # duplicate storage). HA entities read tire_pressure_<pos>_unit for
+    # native_unit via the DYNAMIC_UNIT pattern.
+    tire_pressure_unit: PressureUnit | None = None
+    # Drive mode (CCS2 Chassis.DrivingMode.State): Eco/Sport/Comfort/Snow/Smart…
+    drive_mode: str = None
+    # Low oil level warning (HEV/ICE, CCS2 Drivetrain.InternalCombustionEngine.OilLevelWarning).
+    # None when unreported so the entity is not created for vehicles without the sensor.
+    oil_level_warning_is_on: bool = None
+    # 12V auxiliary battery fault warning (CCS2 Electronics.Battery.Auxiliary.FailWarning).
+    # None when unreported so the entity is not created for vehicles without the sensor.
+    battery_auxiliary_fail_warning_is_on: bool = None
 
     # Service Data
     _next_service_distance: float = None
@@ -164,21 +203,29 @@ class Vehicle:
     _location_latitude: float = None
     _location_longitude: float = None
     _location_last_set_time: datetime.datetime = None
+    # True after an attempt to fetch the (still unknown) location. In-memory
+    # like the coordinates themselves: a restart/reload starts a fresh
+    # attempt. Bounds the unknown-location fetch to one try per session so a
+    # persistently failing Find-My-Car response cannot re-run on every poll.
+    _location_fetch_attempted: bool = False
 
     # EV fields (EV/PHEV)
 
-    ev_charge_port_door_is_open: typing.Union[bool, None] = None
-    ev_charging_power: typing.Union[float, None] = None  # Charging power in kW
+    ev_charge_port_door_is_open: bool | None = None
+    ev_charging_power: float | None = None  # Charging power in kW
 
-    ev_charge_limits_dc: typing.Union[int, None] = None
-    ev_charge_limits_ac: typing.Union[int, None] = None
-    ev_charging_current: typing.Union[int, None] = (
+    ev_charge_limits_dc: int | None = None
+    ev_charge_limits_ac: int | None = None
+    ev_charging_current: int | None = (
         None  # Europe feature only, ac charging current limit
     )
-    ev_v2l_discharge_limit: typing.Union[int, None] = None
+    ev_v2l_discharge_limit: int | None = None
+    ev_v2l_discharge_remain_time: int | None = None  # minutes (raw)
+    ev_v2l_discharge_dte: int | None = None  # raw, unit not enum-mapped
+    ev_v2l_mode: int | None = None  # raw SmartGrid.VehicleToLoad.Mode
 
-    ev_v2l_status: typing.Union[bool, None] = None
-    ev_v2x_status: typing.Union[bool, None] = None
+    ev_v2l_status: bool | None = None
+    ev_v2x_status: bool | None = None
 
     # energy consumed and regenerated since the vehicle was paired with the account
     # (so not necessarily for the vehicle's lifetime)
@@ -197,18 +244,49 @@ class Vehicle:
     ign3: bool = None
     remote_ignition: bool = None
     transmission_condition: str = None
+    gear_position: int | None = None  # raw Transmission.GearPosition
     sleep_mode_check: bool = None
+    auto_cut_battery_prewarning_on: bool | None = None
+
+    # Charge-complete alarm options (GSPA ChargingInformation.Setting.
+    # CompleteAlarm.* — independent preset flags, raw booleans).
+    ev_charge_complete_alarm_before_10min: bool | None = None
+    ev_charge_complete_alarm_before_20min: bool | None = None
+    ev_charge_complete_alarm_before_30min: bool | None = None
+    ev_charge_complete_alarm_off: bool | None = None
+    # Expected charge window (GSPA ChargingInformation.ExpectedTime) —
+    # hour/min guarded by ccs2_reservation_time_or_none (Day semantics
+    # unconfirmed, not exposed).
+    ev_charge_expected_start_time: datetime.time | None = None
+    ev_charge_expected_end_time: datetime.time | None = None
+
+    # Average fuel economy (Drivetrain.FuelSystem.AverageFuelEconomy);
+    # values raw, Unit enum not translated (differs per powertrain).
+    average_fuel_economy_accumulated: float | None = None
+    average_fuel_economy_drive: float | None = None
+    average_fuel_economy_after_refuel: float | None = None
+    average_fuel_economy_unit: int | None = None
 
     # Lamp status fields (KiaUvoApiEU and CA)
     headlamp_status: str = None
     headlamp_left_low: bool = None
     headlamp_right_low: bool = None
+    headlamp_left_high: bool = None
+    headlamp_right_high: bool = None
+    headlamp_left_bifunc: bool = None
+    headlamp_right_bifunc: bool = None
     stop_lamp_left: bool = None
     stop_lamp_right: bool = None
     turn_signal_left_front: bool = None
     turn_signal_right_front: bool = None
     turn_signal_left_rear: bool = None
     turn_signal_right_rear: bool = None
+    hazard_lights_on: bool | None = None
+
+    # GSPA cabin extras (flat CCS2 schema)
+    windshield_front_heater_is_on: bool | None = None
+    air_cleaning_is_on: bool | None = None
+    steering_wheel_heat_step: int | None = None
 
     @property
     def daily_stats(self):
@@ -267,9 +345,17 @@ class Vehicle:
     ev_battery_pack_voltage: int = None
     ev_battery_chiller_rpm: int = None
     ev_battery_heating_state: bool = None
-    ev_battery_water_temperature: int = None
-    ev_battery_temperature_min: int = None
-    ev_battery_temperature_max: int = None
+    _ev_battery_water_temperature: int = None
+    _ev_battery_water_temperature_value: int = None
+    _ev_battery_water_temperature_unit: str = None
+
+    _ev_battery_temperature_min: int = None
+    _ev_battery_temperature_min_value: int = None
+    _ev_battery_temperature_min_unit: str = None
+
+    _ev_battery_temperature_max: int = None
+    _ev_battery_temperature_max_value: int = None
+    _ev_battery_temperature_max_unit: str = None
     ev_battery_winter_mode: bool = None
     ev_battery_soh_percentage: int = None
     ev_battery_remain: int = None
@@ -299,46 +385,46 @@ class Vehicle:
     _ev_estimated_station_charge_duration_value: int = None
     _ev_estimated_station_charge_duration_unit: str = None
 
-    _ev_target_range_charge_AC: typing.Union[float, None] = None
-    _ev_target_range_charge_AC_value: typing.Union[float, None] = None
-    _ev_target_range_charge_AC_unit: typing.Union[str, None] = None
+    _ev_target_range_charge_AC: float | None = None
+    _ev_target_range_charge_AC_value: float | None = None
+    _ev_target_range_charge_AC_unit: str | None = None
 
-    _ev_target_range_charge_DC: typing.Union[float, None] = None
-    _ev_target_range_charge_DC_value: typing.Union[float, None] = None
-    _ev_target_range_charge_DC_unit: typing.Union[str, None] = None
+    _ev_target_range_charge_DC: float | None = None
+    _ev_target_range_charge_DC_value: float | None = None
+    _ev_target_range_charge_DC_unit: str | None = None
 
-    ev_power_consumption_battery_cooling: typing.Union[float, None] = None
-    ev_power_consumption_battery_heater: typing.Union[float, None] = None
-    ev_power_consumption_air_conditioning: typing.Union[float, None] = None
+    ev_power_consumption_battery_cooling: float | None = None
+    ev_power_consumption_battery_heater: float | None = None
+    ev_power_consumption_air_conditioning: float | None = None
 
-    ev_first_departure_enabled: typing.Union[bool, None] = None
-    ev_second_departure_enabled: typing.Union[bool, None] = None
+    ev_first_departure_enabled: bool | None = None
+    ev_second_departure_enabled: bool | None = None
 
-    ev_first_departure_days: typing.Union[list, None] = None
-    ev_second_departure_days: typing.Union[list, None] = None
+    ev_first_departure_days: list | None = None
+    ev_second_departure_days: list | None = None
 
-    ev_first_departure_time: typing.Union[datetime.time, None] = None
-    ev_second_departure_time: typing.Union[datetime.time, None] = None
+    ev_first_departure_time: datetime.time | None = None
+    ev_second_departure_time: datetime.time | None = None
 
-    ev_first_departure_climate_enabled: typing.Union[bool, None] = None
-    ev_second_departure_climate_enabled: typing.Union[bool, None] = None
+    ev_first_departure_climate_enabled: bool | None = None
+    ev_second_departure_climate_enabled: bool | None = None
 
-    _ev_first_departure_climate_temperature: typing.Union[float, None] = None
-    _ev_first_departure_climate_temperature_value: typing.Union[float, None] = None
-    _ev_first_departure_climate_temperature_unit: typing.Union[str, None] = None
+    _ev_first_departure_climate_temperature: float | None = None
+    _ev_first_departure_climate_temperature_value: float | None = None
+    _ev_first_departure_climate_temperature_unit: str | None = None
 
-    _ev_second_departure_climate_temperature: typing.Union[float, None] = None
-    _ev_second_departure_climate_temperature_value: typing.Union[float, None] = None
-    _ev_second_departure_climate_temperature_unit: typing.Union[str, None] = None
+    _ev_second_departure_climate_temperature: float | None = None
+    _ev_second_departure_climate_temperature_value: float | None = None
+    _ev_second_departure_climate_temperature_unit: str | None = None
 
-    ev_first_departure_climate_defrost: typing.Union[bool, None] = None
-    ev_second_departure_climate_defrost: typing.Union[bool, None] = None
+    ev_first_departure_climate_defrost: bool | None = None
+    ev_second_departure_climate_defrost: bool | None = None
 
-    ev_off_peak_start_time: typing.Union[datetime.time, None] = None
-    ev_off_peak_end_time: typing.Union[datetime.time, None] = None
-    ev_off_peak_charge_only_enabled: typing.Union[bool, None] = None
+    ev_off_peak_start_time: datetime.time | None = None
+    ev_off_peak_end_time: datetime.time | None = None
+    ev_off_peak_charge_only_enabled: bool | None = None
 
-    ev_schedule_charge_enabled: typing.Union[bool, None] = None
+    ev_schedule_charge_enabled: bool | None = None
 
     # IC fields (PHEV/HEV/IC)
     _fuel_driving_range: float = None
@@ -375,11 +461,29 @@ class Vehicle:
     def total_driving_range_unit(self):
         return self._total_driving_range_unit
 
+    @property
+    def tire_pressure_front_left_unit(self) -> str | None:
+        """Display-unit label for tire pressure (shared across all tires)."""
+        return PRESSURE_UNITS.get(self.tire_pressure_unit)
+
+    @property
+    def tire_pressure_front_right_unit(self) -> str | None:
+        return PRESSURE_UNITS.get(self.tire_pressure_unit)
+
+    @property
+    def tire_pressure_rear_left_unit(self) -> str | None:
+        return PRESSURE_UNITS.get(self.tire_pressure_unit)
+
+    @property
+    def tire_pressure_rear_right_unit(self) -> str | None:
+        return PRESSURE_UNITS.get(self.tire_pressure_unit)
+
     @total_driving_range.setter
     def total_driving_range(self, value):
         self._total_driving_range_value = value[0]
-        self._total_driving_range_unit = value[1]
         self._total_driving_range = value[0]
+        if value[1] is not None:
+            self._total_driving_range_unit = value[1]
 
     @property
     def next_service_distance(self):
@@ -388,8 +492,9 @@ class Vehicle:
     @next_service_distance.setter
     def next_service_distance(self, value):
         self._next_service_distance_value = value[0]
-        self._next_service_distance_unit = value[1]
         self._next_service_distance = value[0]
+        if value[1] is not None:
+            self._next_service_distance_unit = value[1]
 
     @property
     def last_service_distance(self):
@@ -398,8 +503,9 @@ class Vehicle:
     @last_service_distance.setter
     def last_service_distance(self, value):
         self._last_service_distance_value = value[0]
-        self._last_service_distance_unit = value[1]
         self._last_service_distance = value[0]
+        if value[1] is not None:
+            self._last_service_distance_unit = value[1]
 
     @property
     def last_updated_at(self):
@@ -411,15 +517,32 @@ class Vehicle:
         # https://github.com/Hyundai-Kia-Connect/kia_uvo/issues/931#issuecomment-2381569934
         newest_updated_at = get_safe_local_datetime(value)
         previous_updated_at = self._last_updated_at
-        if newest_updated_at and previous_updated_at:  # both filled
-            if newest_updated_at < previous_updated_at:
-                utcoffset = newest_updated_at.utcoffset()
-                newest_updated_at_corrected = newest_updated_at + utcoffset
-                if newest_updated_at_corrected >= previous_updated_at:
-                    newest_updated_at = newest_updated_at_corrected
-                if newest_updated_at < previous_updated_at:
-                    newest_updated_at = previous_updated_at  # keep old because newer
+        if (
+            newest_updated_at
+            and previous_updated_at
+            and newest_updated_at < previous_updated_at
+        ):
+            utcoffset = newest_updated_at.utcoffset()
+            newest_updated_at_corrected = newest_updated_at + utcoffset
+            if newest_updated_at_corrected >= previous_updated_at:
+                newest_updated_at = newest_updated_at_corrected
+            newest_updated_at = max(
+                newest_updated_at, previous_updated_at
+            )  # keep old because newer
         self._last_updated_at = newest_updated_at
+
+    @property
+    def last_scanned_at(self):
+        """When the integration last polled the server for this vehicle.
+
+        Unlike last_updated_at (which comes from the car's syncDate),
+        this is the local timestamp of when the API call was made.
+        """
+        return self._last_scanned_at
+
+    @last_scanned_at.setter
+    def last_scanned_at(self, value):
+        self._last_scanned_at = value
 
     @property
     def location_latitude(self):
@@ -460,8 +583,9 @@ class Vehicle:
     def odometer(self, value):
         float_value = get_float(value[0])
         self._odometer_value = float_value
-        self._odometer_unit = value[1]
         self._odometer = float_value
+        if value[1] is not None:
+            self._odometer_unit = value[1]
 
     @property
     def outside_temperature(self):
@@ -470,8 +594,9 @@ class Vehicle:
     @outside_temperature.setter
     def outside_temperature(self, value):
         self._outside_temperature_value = value[0]
-        self._outside_temperature_unit = value[1]
-        self._outside_temperature = value[0]
+        self._outside_temperature = float_or_none(value[0])
+        if value[1] is not None:
+            self._outside_temperature_unit = value[1]
 
     @property
     def air_temperature(self):
@@ -480,8 +605,54 @@ class Vehicle:
     @air_temperature.setter
     def air_temperature(self, value):
         self._air_temperature_value = value[0]
-        self._air_temperature_unit = value[1]
-        self._air_temperature = value[0] if value[0] != "OFF" else None
+        self._air_temperature = float_or_none(value[0])
+        if value[1] is not None:
+            self._air_temperature_unit = value[1]
+
+    @property
+    def ev_battery_water_temperature(self):
+        return self._ev_battery_water_temperature
+
+    @property
+    def ev_battery_water_temperature_unit(self):
+        return self._ev_battery_water_temperature_unit
+
+    @ev_battery_water_temperature.setter
+    def ev_battery_water_temperature(self, value):
+        self._ev_battery_water_temperature_value = value[0]
+        self._ev_battery_water_temperature = value[0]
+        if value[1] is not None:
+            self._ev_battery_water_temperature_unit = value[1]
+
+    @property
+    def ev_battery_temperature_min(self):
+        return self._ev_battery_temperature_min
+
+    @property
+    def ev_battery_temperature_min_unit(self):
+        return self._ev_battery_temperature_min_unit
+
+    @ev_battery_temperature_min.setter
+    def ev_battery_temperature_min(self, value):
+        self._ev_battery_temperature_min_value = value[0]
+        self._ev_battery_temperature_min = value[0]
+        if value[1] is not None:
+            self._ev_battery_temperature_min_unit = value[1]
+
+    @property
+    def ev_battery_temperature_max(self):
+        return self._ev_battery_temperature_max
+
+    @property
+    def ev_battery_temperature_max_unit(self):
+        return self._ev_battery_temperature_max_unit
+
+    @ev_battery_temperature_max.setter
+    def ev_battery_temperature_max(self, value):
+        self._ev_battery_temperature_max_value = value[0]
+        self._ev_battery_temperature_max = value[0]
+        if value[1] is not None:
+            self._ev_battery_temperature_max_unit = value[1]
 
     @property
     def ev_driving_range(self):
@@ -494,8 +665,9 @@ class Vehicle:
     @ev_driving_range.setter
     def ev_driving_range(self, value):
         self._ev_driving_range_value = value[0]
-        self._ev_driving_range_unit = value[1]
         self._ev_driving_range = value[0]
+        if value[1] is not None:
+            self._ev_driving_range_unit = value[1]
 
     @property
     def ev_estimated_current_charge_duration(self):
@@ -504,8 +676,9 @@ class Vehicle:
     @ev_estimated_current_charge_duration.setter
     def ev_estimated_current_charge_duration(self, value):
         self._ev_estimated_current_charge_duration_value = value[0]
-        self._ev_estimated_current_charge_duration_unit = value[1]
         self._ev_estimated_current_charge_duration = value[0]
+        if value[1] is not None:
+            self._ev_estimated_current_charge_duration_unit = value[1]
 
     @property
     def ev_estimated_fast_charge_duration(self):
@@ -514,8 +687,9 @@ class Vehicle:
     @ev_estimated_fast_charge_duration.setter
     def ev_estimated_fast_charge_duration(self, value):
         self._ev_estimated_fast_charge_duration_value = value[0]
-        self._ev_estimated_fast_charge_duration_unit = value[1]
         self._ev_estimated_fast_charge_duration = value[0]
+        if value[1] is not None:
+            self._ev_estimated_fast_charge_duration_unit = value[1]
 
     @property
     def ev_estimated_portable_charge_duration(self):
@@ -524,8 +698,9 @@ class Vehicle:
     @ev_estimated_portable_charge_duration.setter
     def ev_estimated_portable_charge_duration(self, value):
         self._ev_estimated_portable_charge_duration_value = value[0]
-        self._ev_estimated_portable_charge_duration_unit = value[1]
         self._ev_estimated_portable_charge_duration = value[0]
+        if value[1] is not None:
+            self._ev_estimated_portable_charge_duration_unit = value[1]
 
     @property
     def ev_estimated_station_charge_duration(self):
@@ -534,8 +709,9 @@ class Vehicle:
     @ev_estimated_station_charge_duration.setter
     def ev_estimated_station_charge_duration(self, value):
         self._ev_estimated_station_charge_duration_value = value[0]
-        self._ev_estimated_station_charge_duration_unit = value[1]
         self._ev_estimated_station_charge_duration = value[0]
+        if value[1] is not None:
+            self._ev_estimated_station_charge_duration_unit = value[1]
 
     @property
     def ev_target_range_charge_AC(self):
@@ -548,8 +724,9 @@ class Vehicle:
     @ev_target_range_charge_AC.setter
     def ev_target_range_charge_AC(self, value):
         self._ev_target_range_charge_AC_value = value[0]
-        self._ev_target_range_charge_AC_unit = value[1]
         self._ev_target_range_charge_AC = value[0]
+        if value[1] is not None:
+            self._ev_target_range_charge_AC_unit = value[1]
 
     @property
     def ev_target_range_charge_DC(self):
@@ -562,8 +739,9 @@ class Vehicle:
     @ev_target_range_charge_DC.setter
     def ev_target_range_charge_DC(self, value):
         self._ev_target_range_charge_DC_value = value[0]
-        self._ev_target_range_charge_DC_unit = value[1]
         self._ev_target_range_charge_DC = value[0]
+        if value[1] is not None:
+            self._ev_target_range_charge_DC_unit = value[1]
 
     @property
     def ev_first_departure_climate_temperature(self):
@@ -576,8 +754,9 @@ class Vehicle:
     @ev_first_departure_climate_temperature.setter
     def ev_first_departure_climate_temperature(self, value):
         self._ev_first_departure_climate_temperature_value = value[0]
-        self._ev_first_departure_climate_temperature_unit = value[1]
         self._ev_first_departure_climate_temperature = value[0]
+        if value[1] is not None:
+            self._ev_first_departure_climate_temperature_unit = value[1]
 
     @property
     def ev_second_departure_climate_temperature(self):
@@ -590,8 +769,9 @@ class Vehicle:
     @ev_second_departure_climate_temperature.setter
     def ev_second_departure_climate_temperature(self, value):
         self._ev_second_departure_climate_temperature_value = value[0]
-        self._ev_second_departure_climate_temperature_unit = value[1]
         self._ev_second_departure_climate_temperature = value[0]
+        if value[1] is not None:
+            self._ev_second_departure_climate_temperature_unit = value[1]
 
     @property
     def fuel_driving_range(self):
@@ -600,5 +780,6 @@ class Vehicle:
     @fuel_driving_range.setter
     def fuel_driving_range(self, value):
         self._fuel_driving_range_value = value[0]
-        self._fuel_driving_range_unit = value[1]
         self._fuel_driving_range = value[0]
+        if value[1] is not None:
+            self._fuel_driving_range_unit = value[1]

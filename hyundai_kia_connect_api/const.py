@@ -24,6 +24,7 @@ REGION_AUSTRALIA = "Australia"
 REGION_NZ = "New Zealand"
 REGION_INDIA = "India"
 REGION_BRAZIL = "Brazil"
+REGION_EUROPE_CCI = "Europe (CCI/GSPA)"
 
 REGIONS = {
     1: REGION_EUROPE,
@@ -34,6 +35,7 @@ REGIONS = {
     6: REGION_INDIA,
     7: REGION_NZ,
     8: REGION_BRAZIL,
+    9: REGION_EUROPE_CCI,
 }
 
 LOGIN_TOKEN_LIFETIME = datetime.timedelta(hours=23)
@@ -51,6 +53,40 @@ DISTANCE_UNITS = {
 TEMPERATURE_C = "°C"
 TEMPERATURE_F = "°F"
 TEMPERATURE_UNITS = {None: None, 0: TEMPERATURE_C, 1: TEMPERATURE_F}
+
+PRESSURE_KPA = "kPa"
+PRESSURE_BAR = "bar"
+PRESSURE_PSI = "psi"
+
+
+class PressureUnit(IntEnum):
+    """Tire-pressure display unit (Chassis.Axle.Tire.PressureUnit, CCS2).
+
+    The car's tire-pressure display unit is user-selectable (psi | kPa | bar);
+    the enum maps to consecutive ints matching the car's selector order.
+    """
+
+    PSI = 0
+    KPA = 1
+    BAR = 2
+
+
+# Model B (live-confirmed EU Santa Fe 2026): raw Pressure is in the car's
+# display unit, and the scale depends on the unit:
+#   bar (PressureUnit.BAR): raw 27 -> 2.7  (x0.1, 0.1-bar steps)
+#   psi (PressureUnit.PSI): raw 38 -> 38   (x1, integer psi)
+#   kPa (PressureUnit.KPA): raw 51 -> 255   (x5, 5-kPa steps) — live-confirmed.
+PRESSURE_UNITS = {
+    PressureUnit.PSI: PRESSURE_PSI,
+    PressureUnit.KPA: PRESSURE_KPA,
+    PressureUnit.BAR: PRESSURE_BAR,
+}
+# Raw Pressure -> display-value scale per PressureUnit (model B).
+PRESSURE_SCALES = {
+    PressureUnit.PSI: 1.0,
+    PressureUnit.KPA: 5.0,
+    PressureUnit.BAR: 0.1,
+}
 
 SEAT_STATUS = {
     None: None,
@@ -111,6 +147,13 @@ class WINDOW_STATE(IntEnum):
     CLOSED = 0
     OPEN = 1
     VENTILATION = 2
+
+
+class SEAT_LOCATION(str, Enum):
+    """Driver seat location (GSPA drvSeatLoc wire values)."""
+
+    LEFT = "L"
+    RIGHT = "R"
 
 
 class VALET_MODE_ACTION(Enum):

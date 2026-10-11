@@ -2,29 +2,52 @@
 
 # pylint:disable=logging-fstring-interpolation,deprecated-method,invalid-name,broad-exception-caught,unused-argument,missing-function-docstring
 
+import base64
 import datetime as dt
 import logging
 import time
-import typing as ty
+from typing import ClassVar
 
 import certifi
-import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.ssl_ import create_urllib3_context
 
-from hyundai_kia_connect_api.exceptions import APIError, AuthenticationError
+from hyundai_kia_connect_api.exceptions import (
+    APIError,
+    AuthenticationError,
+    DuplicateRequestError,
+    RequestTimeoutError,
+    SafetyAcknowledgmentError,
+    ServiceTemporaryUnavailable,
+)
 
-from .ApiImpl import ApiImpl, ClimateRequestOptions
+from .ApiImpl import ApiImpl, ApiImplSession, ClimateRequestOptions
 from .const import (
     DISTANCE_UNITS,
     DOMAIN,
     ENGINE_TYPES,
+    ORDER_STATUS,
     SEAT_STATUS,
     TEMPERATURE_UNITS,
     VEHICLE_LOCK_ACTION,
 )
+from .svm import (
+    SVMDetails,
+    _parse_bool,
+    _parse_door_open,
+    _parse_float_list,
+    _parse_image_sizes,
+    _parse_int,
+    redact_svm_metadata,
+)
 from .Token import Token
-from .utils import get_child_value, get_float, parse_datetime
+from .utils import (
+    float_or_none,
+    get_child_value,
+    get_float,
+    normalize_battery_soc,
+    parse_datetime,
+)
 from .Vehicle import (
     DailyDrivingStats,
     DayTripCounts,
@@ -37,6 +60,118 @@ from .Vehicle import (
 CIPHERS = "DEFAULT@SECLEVEL=1"
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _check_response_for_errors(response: dict) -> None:
+    """
+    Checks for errors in the API response.
+    If an error is found, an exception is raised.
+
+    The HATA backend returns errorCode as int (e.g. 502) in the
+    response body.  HTTP 502 from HATA is a server-side error
+    ("HATA remoteVehicleStatus service failed"), NOT an
+    authentication failure.  502 maps to ServiceTemporaryUnavailable;
+    other codes raise generic APIError.
+
+    :param response: the API's JSON response
+    """
+    error_code_mapping = {
+        "502": ServiceTemporaryUnavailable,
+    }
+    if "errorCode" in response:
+        system = response.get("systemName", "")
+        function = response.get("functionName", "")
+        suffix = f" [{system}/{function}]" if system or function else ""
+        code = str(response["errorCode"])
+        exc = error_code_mapping.get(code, APIError)
+        raise exc(f"API Error {code}{suffix}: {response['errorMessage']}")
+
+
+def _safe_parse_json(response, action_name: str):
+    """
+    Safely parse JSON response from Hyundai USA API.
+
+    Control commands (lock, unlock, climate, charge, etc.) return
+    HTTP 200 with an empty body on success. Calling response.json()
+    on an empty body raises JSONDecodeError even though the command
+    succeeded.
+
+    Args:
+        response: the HTTP response object
+        action_name: name of the action for logging purposes
+
+    Returns:
+        dict: parsed JSON if body exists
+        None: if body is empty (command succeeded, nothing to return)
+
+    Raises:
+        APIError: if HTTP status is not 200
+    """
+    if response.status_code != 200:
+        raise APIError(
+            f"{action_name} failed with "
+            f"HTTP {response.status_code}: '{response.text[:200]}'"
+        )
+
+    if not response.text.strip():
+        _LOGGER.debug(
+            f"{DOMAIN} - Empty response body for {action_name} "
+            f"(HTTP 200). Command succeeded."
+        )
+        return None
+
+    return response.json()
+
+
+def parse_svm_response(response: dict, timezone: dt.timezone) -> SVMDetails:
+    """Parse a getSVMDetails response into SVMDetails.
+
+    Args:
+        response: parsed JSON from `GET /ac/v2/svm/getSVMDetails`.
+        timezone: timezone to use when parsing the capture timestamp.
+
+    Returns:
+        SVMDetails with decoded image bytes and metadata.
+    """
+    detail = get_child_value(response, "svmDetails.0.svmDetail") or {}
+    image_b64 = detail.get("svmImage", "")
+    try:
+        image_bytes = base64.b64decode(image_b64) if image_b64 else b""
+    except (ValueError, TypeError):
+        image_bytes = b""
+
+    captured_at_raw = get_child_value(detail, "gpsDetail.time")
+    captured_at = None
+    if captured_at_raw:
+        try:
+            captured_at = parse_datetime(captured_at_raw, timezone)
+        except (ValueError, TypeError):
+            _LOGGER.debug("Unable to parse SVM capture timestamp: %s", captured_at_raw)
+
+    image_size, image_sizes = _parse_image_sizes(detail.get("imageSize"))
+
+    speed_value = float_or_none(get_child_value(detail, "gpsDetail.speed.value"))
+    speed_unit = get_child_value(detail, "gpsDetail.speed.unit")
+
+    # Store the full response for advanced consumers, but redact the base64
+    # image so we don't duplicate the image bytes in memory.
+    raw_metadata = redact_svm_metadata(response, gps=False)
+
+    return SVMDetails(
+        image_bytes=image_bytes,
+        captured_at=captured_at,
+        captured_at_raw=captured_at_raw,
+        latitude=float_or_none(get_child_value(detail, "gpsDetail.coord.lat")),
+        longitude=float_or_none(get_child_value(detail, "gpsDetail.coord.lon")),
+        heading=_parse_int(get_child_value(detail, "gpsDetail.head")),
+        speed=(speed_value, speed_unit),
+        door_open=_parse_door_open(detail.get("doorOpen")),
+        trunk_open=_parse_bool(detail.get("trunkOpen")),
+        image_size=image_size,
+        image_sizes=image_sizes,
+        valid_angle_of_view=_parse_float_list(detail.get("validAngleofView")),
+        raw_metadata=raw_metadata,
+    )
 
 
 class cipherAdapter(HTTPAdapter):
@@ -65,7 +200,28 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
     """HyundaiBlueLinkApiUSA"""
 
     # initialize with a timestamp which will allow the first fetch to occur
-    last_loc_timestamp = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)
+    last_loc_timestamp = dt.datetime.now(dt.UTC) - dt.timedelta(hours=3)
+
+    # SVM/Find My Car polling constants
+    _SVM_POLL_INTERVAL_SECONDS = 15
+    _SVM_POLL_TIMEOUT_SECONDS = 120
+    _SVM_INITIAL_WAIT_SECONDS = 15
+
+    # Hyundai BlueLink USA exposes SVM / Find My Car for supported vehicles.
+    # Capability is declared per-region (like supports_window_control); the
+    # actual image is fetched on demand via get_svm_details / request_svm_capture.
+    supports_svm: bool = True
+
+    # Maps transaction IDs to service_type values for action status polling.
+    # Horn/hazard commands need HORN_AND_LIGHTS or LIGHTS_ONLY instead of
+    # the default REMOTE_POLL.
+    _action_service_types: ClassVar[dict[str, str]] = {}
+
+    # Cached enrollment/details response. Capabilities, seat configs,
+    # generation and model rarely change, so the response is cached for
+    # the instance lifetime. get_vehicles force-refreshes (vehicle list
+    # can change); _get_vehicle_details uses the cache.
+    _enrollment_details_cache: dict | None = None
 
     def __init__(self, region: int, brand: int, language: str):
         self.LANGUAGE: str = language
@@ -88,7 +244,7 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
             "accept": "application/json, text/plain, */*",
             "accept-encoding": "gzip, deflate, br",
             "accept-language": "en-US,en;q=0.9",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.142 Safari/537.36",  # noqa
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.142 Safari/537.36",
             "host": self.BASE_URL,
             "origin": origin,
             "referer": referer,
@@ -105,8 +261,8 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
             "client_id": "m66129Bb-em93-SPAHYN-bZ91-am4540zp19920",
             "clientSecret": "v558o935-6nne-423i-baa8",
         }
-        self.sessions = requests.Session()
-        self.sessions.mount(origin, cipherAdapter())
+        self.session = ApiImplSession()
+        self.session.mount(origin, cipherAdapter())
 
         _LOGGER.debug(f"{DOMAIN} - initial API headers: {self.API_HEADERS}")
 
@@ -128,27 +284,27 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
         self,
         username: str,
         password: str,
-        otp_handler: ty.Callable[[dict], dict] | None = None,
         pin: str | None = None,
     ) -> Token:
         # Sign In with Email and Password and Get Authorization Code
         url = self.LOGIN_API + "oauth/token"
         data = {"username": username, "password": password}
 
-        response = self.sessions.post(url, json=data, headers=self.API_HEADERS)
-        _LOGGER.debug(f"{DOMAIN} - Sign In Response {response.text}")
+        response = self.session.post(url, json=data, headers=self.API_HEADERS)
         response = response.json()
+        _check_response_for_errors(response)
         if response.get("access_token") is None:
-            raise AuthenticationError(
-                "Login failed: " + response.get("errorMessage", "")
+            raise APIError(
+                "Error Code: "
+                + response.get("errorCode", "")
+                + " - Login failed: "
+                + response.get("errorMessage", "")
             )
         access_token = response["access_token"]
         refresh_token = response["refresh_token"]
         expires_in = float(response["expires_in"])
 
-        valid_until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
-            seconds=expires_in
-        )
+        valid_until = dt.datetime.now(dt.UTC) + dt.timedelta(seconds=expires_in)
 
         return Token(
             username=username,
@@ -159,12 +315,89 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
             pin=pin,
         )
 
-    def _get_vehicle_details(self, token: Token, vehicle: Vehicle):
+    def refresh_access_token(self, token: Token) -> Token:
+        """Refresh the access token using the stored refresh token.
+
+        Calls the same /v2/ac/oauth/token endpoint as login, but sends
+        username + password + grant_type=refresh_token + refresh_token
+        together in a JSON body. The endpoint validates username/password
+        presence before inspecting grant_type, so all four fields must be
+        sent (sending grant_type + refresh_token alone returns 400
+        "password required"). Falls back to full login if the refresh
+        token is missing or the exchange fails.
+
+        Confirmed working live (2026-06-22, issue #1186): ~0.02s refresh
+        vs ~0.74s full login, refresh_token rotates, expires_in ~1800s.
+        """
+        if token.refresh_token:
+            try:
+                url = self.LOGIN_API + "oauth/token"
+                data = {
+                    "username": token.username,
+                    "password": token.password,
+                    "grant_type": "refresh_token",
+                    "refresh_token": token.refresh_token,
+                }
+                response = self.session.post(url, json=data, headers=self.API_HEADERS)
+                response_json = response.json()
+                _check_response_for_errors(response_json)
+                if response_json.get("access_token") is None:
+                    raise APIError(
+                        f"{DOMAIN} - refresh_access_token: no access_token "
+                        f"in response {response_json}"
+                    )
+                access_token = response_json["access_token"]
+                new_refresh_token = response_json.get(
+                    "refresh_token", token.refresh_token
+                )
+                expires_in = float(response_json["expires_in"])
+                valid_until = dt.datetime.now(dt.UTC) + dt.timedelta(seconds=expires_in)
+                _LOGGER.debug(
+                    f"{DOMAIN} - Access token refreshed successfully, "
+                    f"expires in {expires_in}s"
+                )
+                return Token(
+                    username=token.username,
+                    password=token.password,
+                    access_token=access_token,
+                    refresh_token=new_refresh_token,
+                    valid_until=valid_until,
+                    pin=token.pin,
+                )
+            except Exception:
+                _LOGGER.warning(
+                    f"{DOMAIN} - Refresh token exchange failed, "
+                    f"falling back to full login"
+                )
+                return self.login(token.username, token.password, token.pin)
+        # No refresh_token available — full login.
+        return self.login(token.username, token.password, token.pin)
+
+    def _get_enrollment_details(
+        self, token: Token, force_refresh: bool = False
+    ) -> dict:
+        """Return enrollment details for the account, cached on the instance.
+
+        Capabilities, seat configs, generation and model change rarely, so
+        the response is cached for the instance lifetime. ``get_vehicles``
+        forces a refresh (the vehicle list can change); ``_get_vehicle_details``
+        uses the cache.
+        """
+        if self._enrollment_details_cache is not None and not force_refresh:
+            return self._enrollment_details_cache
         url = self.API_URL + "enrollment/details/" + token.username
         headers = self._get_authenticated_headers(token)
-        response = self.sessions.get(url, headers=headers)
+        response = self.session.get(url, headers=headers)
         _LOGGER.debug(f"{DOMAIN} - Get Vehicles Response {response.text}")
-        response = response.json()
+        response_json = response.json()
+        _check_response_for_errors(response_json)
+        if "enrolledVehicleDetails" not in response_json:
+            raise AuthenticationError("Missing enrolledVehicleDetails in response")
+        self._enrollment_details_cache = response_json
+        return response_json
+
+    def _get_vehicle_details(self, token: Token, vehicle: Vehicle):
+        response = self._get_enrollment_details(token)
         for entry in response["enrolledVehicleDetails"]:
             entry = entry["vehicleDetails"]
             if entry["regid"] == vehicle.id:
@@ -179,8 +412,9 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
         if refresh:
             headers["REFRESH"] = "true"
 
-        response = self.sessions.get(url, headers=headers)
+        response = self.session.get(url, headers=headers)
         response = response.json()
+        _check_response_for_errors(response)
         _LOGGER.debug(f"{DOMAIN} - get_vehicle_status response {response}")
 
         status = dict(response["vehicleStatus"])
@@ -205,8 +439,9 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
         # This header is sent by the MyHyundai app, but doesn't seem to do anything
         # headers["offset"] = "-5"
 
-        response = self.sessions.get(url, headers=headers)
+        response = self.session.get(url, headers=headers)
         response = response.json()
+        _check_response_for_errors(response)
         _LOGGER.debug(f"{DOMAIN} - get_ev_trip_details response {response}")
 
         return response
@@ -224,8 +459,9 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
         url = self.API_URL + "rcs/rfc/findMyCar"
         headers = self._get_vehicle_headers(token, vehicle)
         try:
-            response = self.sessions.get(url, headers=headers)
+            response = self.session.get(url, headers=headers)
             response_json = response.json()
+            _check_response_for_errors(response_json)
             _LOGGER.debug(f"{DOMAIN} - Get Vehicle Location {response_json}")
             if response_json.get("coord") is not None:
                 return response_json
@@ -234,11 +470,11 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
                     response_json.get("errorCode", 0) == 502
                     and response_json.get("errorSubCode", "") == "HT_534"
                 ):
-                    _LOGGER.warn(
+                    _LOGGER.warning(
                         f"{DOMAIN} - get vehicle location rate limit exceeded."
                     )
                 else:
-                    _LOGGER.warn(
+                    _LOGGER.warning(
                         f"{DOMAIN} - Unable to get vehicle location: {response_json}"
                     )
 
@@ -257,12 +493,12 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
         vehicle.total_driving_range = (
             get_child_value(
                 state,
-                "vehicleStatus.evStatus.drvDistance.0.rangeByFuel.totalAvailableRange.value",  # noqa
+                "vehicleStatus.evStatus.drvDistance.0.rangeByFuel.totalAvailableRange.value",
             ),
             DISTANCE_UNITS[
                 get_child_value(
                     state,
-                    "vehicleStatus.evStatus.drvDistance.0.rangeByFuel.totalAvailableRange.unit",  # noqa
+                    "vehicleStatus.evStatus.drvDistance.0.rangeByFuel.totalAvailableRange.unit",
                 )
             ],
         )
@@ -282,12 +518,18 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
                     )
                 ],
             )
+        odometer_values = (
+            float_or_none(get_child_value(state, "vehicleDetails.odometer")),
+            float_or_none(get_child_value(state, "vehicleStatus.odometer")),
+        )
         vehicle.odometer = (
-            get_child_value(state, "vehicleDetails.odometer"),
+            max(
+                (value for value in odometer_values if value is not None), default=None
+            ),
             DISTANCE_UNITS[3],
         )
-        vehicle.car_battery_percentage = get_child_value(
-            state, "vehicleStatus.battery.batSoc"
+        vehicle.car_battery_percentage = normalize_battery_soc(
+            get_child_value(state, "vehicleStatus.battery.batSoc")
         )
         vehicle.engine_is_running = get_child_value(state, "vehicleStatus.engine")
         vehicle.washer_fluid_warning_is_on = get_child_value(
@@ -306,7 +548,7 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
             air_temp = self.temperature_range[0]
         if air_temp == "HI":
             air_temp = self.temperature_range[-1]
-        if air_temp:
+        if air_temp not in (None, "OFF"):
             vehicle.air_temperature = (air_temp, TEMPERATURE_UNITS[1])
         vehicle.defrost_is_on = get_child_value(state, "vehicleStatus.defrost")
         vehicle.steering_wheel_heater_is_on = get_child_value(
@@ -318,18 +560,18 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
         vehicle.side_mirror_heater_is_on = get_child_value(
             state, "vehicleStatus.sideMirrorHeat"
         )
-        vehicle.front_left_seat_status = SEAT_STATUS[
+        vehicle.front_left_seat_status = SEAT_STATUS.get(
             get_child_value(state, "vehicleStatus.seatHeaterVentState.flSeatHeatState")
-        ]
-        vehicle.front_right_seat_status = SEAT_STATUS[
+        )
+        vehicle.front_right_seat_status = SEAT_STATUS.get(
             get_child_value(state, "vehicleStatus.seatHeaterVentState.frSeatHeatState")
-        ]
-        vehicle.rear_left_seat_status = SEAT_STATUS[
+        )
+        vehicle.rear_left_seat_status = SEAT_STATUS.get(
             get_child_value(state, "vehicleStatus.seatHeaterVentState.rlSeatHeatState")
-        ]
-        vehicle.rear_right_seat_status = SEAT_STATUS[
+        )
+        vehicle.rear_right_seat_status = SEAT_STATUS.get(
             get_child_value(state, "vehicleStatus.seatHeaterVentState.rrSeatHeatState")
-        ]
+        )
         vehicle.tire_pressure_rear_left_warning_is_on = bool(
             get_child_value(
                 state, "vehicleStatus.tirePressureLamp.tirePressureWarningLampRearLeft"
@@ -392,8 +634,12 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
         vehicle.ev_battery_is_plugged_in = get_child_value(
             state, "vehicleStatus.evStatus.batteryPlugin"
         )
+        # `realTimePower` is instantaneous charging power, and is what
+        # KiaUvoApiUSA and ApiImplType1 report for `ev_charging_power`. The
+        # sibling `batteryStndChrgPower` is *standard*/AC charge power: it holds
+        # the AC rate through a DC fast charge, so it never reports one.
         vehicle.ev_charging_power = get_child_value(
-            state, "vehicleStatus.evStatus.batteryStndChrgPower"
+            state, "vehicleStatus.evStatus.realTimePower"
         )
         ChargeDict = get_child_value(
             state, "vehicleStatus.evStatus.reservChargeInfos.targetSOClist"
@@ -469,12 +715,12 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
             vehicle.fuel_driving_range = (
                 get_child_value(
                     state,
-                    "vehicleStatus.evStatus.drvDistance.0.rangeByFuel.gasModeRange.value",  # noqa
+                    "vehicleStatus.evStatus.drvDistance.0.rangeByFuel.gasModeRange.value",
                 ),
                 DISTANCE_UNITS[
                     get_child_value(
                         state,
-                        "vehicleStatus.evStatus.drvDistance.0.rangeByFuel.gasModeRange.unit",  # noqa
+                        "vehicleStatus.evStatus.drvDistance.0.rangeByFuel.gasModeRange.unit",
                     )
                 ],
             )
@@ -514,7 +760,7 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
             and previous_odometer > vehicle.odometer
         ):
             _LOGGER.debug(
-                f"Overruling odometer: {previous_odometer:.1f} old: {vehicle.odometer:.1f}"  # noqa
+                f"Overruling odometer: {previous_odometer:.1f} old: {vehicle.odometer:.1f}"
             )
             vehicle.odometer = (
                 previous_odometer,
@@ -725,7 +971,7 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
                     vehicle_location_result = self._get_vehicle_location(token, vehicle)
                 else:
                     _LOGGER.debug(
-                        f"{DOMAIN} - update_vehicle_with_cached_state keep Location fallback"  # noqa
+                        f"{DOMAIN} - update_vehicle_with_cached_state keep Location fallback"
                     )
             else:
                 vehicle_location_result = self._get_vehicle_location(token, vehicle)
@@ -734,7 +980,7 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
                 state["vehicleStatus"]["vehicleLocation"] = vehicle_location_result
             else:
                 _LOGGER.debug(
-                    f"{DOMAIN} - update_vehicle_with_cached_state Location fallback"  # noqa
+                    f"{DOMAIN} - update_vehicle_with_cached_state Location fallback"
                 )
 
         self._update_vehicle_properties(vehicle, state)
@@ -752,19 +998,132 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
             else:
                 cached_location = state["vehicleStatus"]["vehicleLocation"]
                 _LOGGER.debug(
-                    f"{DOMAIN} - force_refresh_vehicle_state Location fallback {cached_location}"  # noqa
+                    f"{DOMAIN} - force_refresh_vehicle_state Location fallback {cached_location}"
                 )
 
         self._update_vehicle_properties(vehicle, state)
 
+    def get_svm_details(self, token: Token, vehicle: Vehicle) -> SVMDetails:
+        """Return the latest SVM composite image and metadata."""
+        url = self.API_URL + "svm/getSVMDetails"
+        headers = self._get_vehicle_headers(token, vehicle)
+
+        response = self.session.get(url, headers=headers)
+        response_json = response.json()
+        _check_response_for_errors(response_json)
+        _LOGGER.debug(
+            f"{DOMAIN} - get_svm_details response: {redact_svm_metadata(response_json)}"
+        )
+
+        return parse_svm_response(response_json, self.data_timezone)
+
+    def request_svm_capture(
+        self,
+        token: Token,
+        vehicle: Vehicle,
+        acknowledged_warning: bool = False,
+    ) -> SVMDetails:
+        """Trigger a fresh SVM capture and return the resulting image.
+
+        Args:
+            token: valid Token.
+            vehicle: target Vehicle.
+            acknowledged_warning: must be True; the caller must explicitly
+                acknowledge the safety warning before requesting a capture.
+
+        Returns:
+            SVMDetails for the newly captured image.
+
+        Raises:
+            SafetyAcknowledgmentError: if acknowledged_warning is False.
+            DuplicateRequestError: if a previous SVM request is still pending.
+            RequestTimeoutError: if the image does not refresh within the
+                configured timeout.
+        """
+        if not acknowledged_warning:
+            raise SafetyAcknowledgmentError(
+                "request_svm_capture requires acknowledged_warning=True"
+            )
+
+        # Establish a baseline timestamp so we can detect a fresh capture.
+        baseline = self.get_svm_details(token, vehicle)
+        baseline_time = baseline.captured_at
+        baseline_raw = baseline.captured_at_raw
+
+        url = self.API_URL + "svm/findMyCarSVM"
+        headers = self._get_vehicle_headers(token, vehicle)
+        data = {
+            "vin": vehicle.VIN,
+            "username": token.username,
+            "gen": str(vehicle.generation),
+            "blueLinkServicePin": token.pin,
+        }
+
+        response = self.session.post(url, headers=headers, json=data)
+        if response.status_code == 502:
+            try:
+                response_json = response.json()
+            except Exception:  # pylint: disable=broad-exception-caught
+                raise APIError("SVM request failed with HTTP 502")
+            if response_json.get("errorSubCode") == "HT_533":
+                raise DuplicateRequestError(
+                    response_json.get(
+                        "errorMessage",
+                        "A previous SVM request is still pending.",
+                    )
+                )
+            # For findMyCarSVM, a generic 502 is a transient server-side
+            # failure rather than an authentication problem. Mapping it to
+            # AuthenticationError would mislead callers, so surface it as a
+            # plain APIError using the message the server returned.
+            if response_json.get("errorCode") == "502":
+                raise APIError(
+                    response_json.get(
+                        "errorMessage",
+                        "findMyCarSVM failed with HTTP 502",
+                    )
+                )
+            _check_response_for_errors(response_json)
+
+        response_json = _safe_parse_json(response, "request_svm_capture")
+        if response_json is not None:
+            _check_response_for_errors(response_json)
+            _LOGGER.debug(
+                f"{DOMAIN} - request_svm_capture response: "
+                f"tid={response_json.get('tid')}"
+            )
+
+        time.sleep(self._SVM_INITIAL_WAIT_SECONDS)
+
+        elapsed = self._SVM_INITIAL_WAIT_SECONDS
+        while elapsed < self._SVM_POLL_TIMEOUT_SECONDS:
+            details = self.get_svm_details(token, vehicle)
+            if self._svm_is_fresh(details, baseline_time, baseline_raw):
+                return details
+            time.sleep(self._SVM_POLL_INTERVAL_SECONDS)
+            elapsed += self._SVM_POLL_INTERVAL_SECONDS
+
+        raise RequestTimeoutError(
+            "SVM capture did not produce a new image within "
+            f"{self._SVM_POLL_TIMEOUT_SECONDS} seconds"
+        )
+
+    @staticmethod
+    def _svm_is_fresh(
+        details: SVMDetails,
+        baseline_time: dt.datetime | None,
+        baseline_raw: str | None,
+    ) -> bool:
+        """Return True if `details` is newer than the baseline capture."""
+        if details.captured_at is not None and baseline_time is not None:
+            return details.captured_at > baseline_time
+        if details.captured_at_raw is not None and baseline_raw is not None:
+            return details.captured_at_raw != baseline_raw
+        # Without any timestamp we cannot determine freshness.
+        return False
+
     def get_vehicles(self, token: Token):
-        url = self.API_URL + "enrollment/details/" + token.username
-        headers = self._get_authenticated_headers(token)
-        response = self.sessions.get(url, headers=headers)
-        _LOGGER.debug(f"{DOMAIN} - Get Vehicles Response {response.text}")
-        response = response.json()
-        if "enrolledVehicleDetails" not in response:
-            raise AuthenticationError("Missing enrolledVehicleDetails in response")
+        response = self._get_enrollment_details(token, force_refresh=True)
         result = []
         for entry in response["enrolledVehicleDetails"]:
             entry = entry["vehicleDetails"]
@@ -773,6 +1132,8 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
                 entry_engine_type = ENGINE_TYPES.ICE
             elif entry["evStatus"] == "E":
                 entry_engine_type = ENGINE_TYPES.EV
+            elif entry["evStatus"] == "P":
+                entry_engine_type = ENGINE_TYPES.PHEV
             vehicle: Vehicle = Vehicle(
                 id=entry["regid"],
                 name=entry["nickName"],
@@ -788,7 +1149,54 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
 
         return result
 
-    def lock_action(self, token: Token, vehicle: Vehicle, action) -> None:
+    def _get_transaction_id(self, response) -> str | None:
+        for key in ("tmsTid", "transactionId", "Xid"):
+            if key in response.headers:
+                return response.headers[key]
+        _LOGGER.warning(
+            f"{DOMAIN} - No transaction ID found in response headers: "
+            f"{dict(response.headers)}"
+        )
+        return None
+
+    def check_action_status(
+        self,
+        token: Token,
+        vehicle: Vehicle,
+        action_id: str,
+        synchronous: bool = False,
+        timeout: int = 120,
+    ) -> ORDER_STATUS:
+        url = self.API_URL + "rmt/getRunningStatus"
+        headers = self._get_vehicle_headers(token, vehicle)
+        headers["tid"] = action_id
+        headers["login_id"] = token.username
+        service_type = self._action_service_types.pop(action_id, "REMOTE_POLL")
+        headers["service_type"] = service_type
+
+        max_attempts = 1 if not synchronous else max(1, timeout // 2)
+
+        for _ in range(max_attempts):
+            response = self.session.get(url, headers=headers)
+            response_json = _safe_parse_json(response, "check_action_status")
+            if response_json is None:
+                if not synchronous:
+                    return ORDER_STATUS.UNKNOWN
+                time.sleep(2)
+                continue
+            status = response_json.get("status", "")
+            if status == "SUCCESS":
+                return ORDER_STATUS.SUCCESS
+            elif status == "ERROR":
+                return ORDER_STATUS.FAILED
+            if synchronous:
+                time.sleep(2)
+
+        if synchronous:
+            return ORDER_STATUS.TIMEOUT
+        return ORDER_STATUS.PENDING
+
+    def lock_action(self, token: Token, vehicle: Vehicle, action) -> str:
         _LOGGER.debug(f"{DOMAIN} - Action for lock is: {action}")
 
         if action == VEHICLE_LOCK_ACTION.LOCK:
@@ -804,16 +1212,16 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
         headers["APPCLOUD-VIN"] = vehicle.VIN
 
         data = {"userName": token.username, "vin": vehicle.VIN}
-        response = self.sessions.post(url, headers=headers, json=data)
-        # response_headers = response.headers
-        # response = response.json()
-        # action_status = self.check_action_status(token, headers["pAuth"], response_headers["transactionId"])  # noqa
-
-        # _LOGGER.debug(f"{DOMAIN} - Received lock_action response {action_status}")
+        response = self.session.post(url, headers=headers, json=data)
+        response_json = _safe_parse_json(response, "lock_action")
+        if response_json is not None:
+            _check_response_for_errors(response_json)
         _LOGGER.debug(
-            f"{DOMAIN} - Received lock_action response status code: {response.status_code}"  # noqa
+            f"{DOMAIN} - Received lock_action response status code: {response.status_code}"
         )
         _LOGGER.debug(f"{DOMAIN} - Received lock_action response: {response.text}")
+
+        return self._get_transaction_id(response)
 
     def start_climate(
         self, token: Token, vehicle: Vehicle, options: ClimateRequestOptions
@@ -881,13 +1289,18 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
             }
         _LOGGER.debug(f"{DOMAIN} - Start engine data: {data}")
 
-        response = self.sessions.post(url, json=data, headers=headers)
+        response = self.session.post(url, json=data, headers=headers)
+        response_json = _safe_parse_json(response, "start_climate")
+        if response_json is not None:
+            _check_response_for_errors(response_json)
         _LOGGER.debug(
             f"{DOMAIN} - Start engine response status code: {response.status_code}"
         )
         _LOGGER.debug(f"{DOMAIN} - Start engine response: {response.text}")
 
-    def stop_climate(self, token: Token, vehicle: Vehicle) -> None:
+        return self._get_transaction_id(response)
+
+    def stop_climate(self, token: Token, vehicle: Vehicle) -> str:
         _LOGGER.debug(f"{DOMAIN} - Stop engine..")
 
         if vehicle.engine_type == ENGINE_TYPES.EV:
@@ -899,13 +1312,18 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
 
         _LOGGER.debug(f"{DOMAIN} - Stop engine headers: {headers}")
 
-        response = self.sessions.post(url, headers=headers)
+        response = self.session.post(url, headers=headers)
+        response_json = _safe_parse_json(response, "stop_climate")
+        if response_json is not None:
+            _check_response_for_errors(response_json)
         _LOGGER.debug(
             f"{DOMAIN} - Stop engine response status code: {response.status_code}"
         )
         _LOGGER.debug(f"{DOMAIN} - Stop engine response: {response.text}")
 
-    def start_charge(self, token: Token, vehicle: Vehicle) -> None:
+        return self._get_transaction_id(response)
+
+    def start_charge(self, token: Token, vehicle: Vehicle) -> str:
         if vehicle.engine_type != ENGINE_TYPES.EV:
             return {}
 
@@ -915,13 +1333,18 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
         headers = self._get_vehicle_headers(token, vehicle)
         _LOGGER.debug(f"{DOMAIN} - Start charging headers: {headers}")
 
-        response = self.sessions.post(url, headers=headers)
+        response = self.session.post(url, headers=headers)
+        response_json = _safe_parse_json(response, "start_charge")
+        if response_json is not None:
+            _check_response_for_errors(response_json)
         _LOGGER.debug(
             f"{DOMAIN} - Start charge response status code: {response.status_code}"
         )
         _LOGGER.debug(f"{DOMAIN} - Start charge response: {response.text}")
 
-    def stop_charge(self, token: Token, vehicle: Vehicle) -> None:
+        return self._get_transaction_id(response)
+
+    def stop_charge(self, token: Token, vehicle: Vehicle) -> str:
         if vehicle.engine_type != ENGINE_TYPES.EV:
             return {}
 
@@ -931,11 +1354,16 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
         headers = self._get_vehicle_headers(token, vehicle)
         _LOGGER.debug(f"{DOMAIN} - Stop charging headers: {headers}")
 
-        response = self.sessions.post(url, headers=headers)
+        response = self.session.post(url, headers=headers)
+        response_json = _safe_parse_json(response, "stop_charge")
+        if response_json is not None:
+            _check_response_for_errors(response_json)
         _LOGGER.debug(
             f"{DOMAIN} - Stop charge response status code: {response.status_code}"
         )
         _LOGGER.debug(f"{DOMAIN} - Stop charge response: {response.text}")
+
+        return self._get_transaction_id(response)
 
     def set_charge_limits(
         self, token: Token, vehicle: Vehicle, ac: int, dc: int
@@ -963,8 +1391,59 @@ class HyundaiBlueLinkApiUSA(ApiImpl):
 
         _LOGGER.debug(f"{DOMAIN} - Setting charge limits body: {data}")
 
-        response = self.sessions.post(url, json=data, headers=headers)
+        response = self.session.post(url, json=data, headers=headers)
+        response_json = _safe_parse_json(response, "set_charge_limits")
+        if response_json is not None:
+            _check_response_for_errors(response_json)
         _LOGGER.debug(
-            f"{DOMAIN} - Setting charge limits response status code: {response.status_code}"  # noqa
+            f"{DOMAIN} - Setting charge limits response status code: {response.status_code}"
         )
         _LOGGER.debug(f"{DOMAIN} - Setting charge limits: {response.text}")
+
+        return self._get_transaction_id(response)
+
+    def start_hazard_lights(self, token: Token, vehicle: Vehicle) -> str:
+        url = self.API_URL + "rcs/rhl/light"
+        headers = self._get_vehicle_headers(token, vehicle)
+        headers["APPCLOUD-VIN"] = vehicle.VIN
+
+        data = {"userName": token.username, "vin": vehicle.VIN}
+        response = self.session.post(url, headers=headers, json=data)
+        response_json = _safe_parse_json(response, "start_hazard_lights")
+        if response_json is not None:
+            _check_response_for_errors(response_json)
+        _LOGGER.debug(
+            f"{DOMAIN} - Received start_hazard_lights response status code: "
+            f"{response.status_code}"
+        )
+        _LOGGER.debug(
+            f"{DOMAIN} - Received start_hazard_lights response: {response.text}"
+        )
+
+        action_id = self._get_transaction_id(response)
+        if action_id:
+            self._action_service_types[action_id] = "LIGHTS_ONLY"
+        return action_id
+
+    def start_hazard_lights_and_horn(self, token: Token, vehicle: Vehicle) -> str:
+        url = self.API_URL + "rcs/rhl/hnl"
+        headers = self._get_vehicle_headers(token, vehicle)
+        headers["APPCLOUD-VIN"] = vehicle.VIN
+
+        data = {"userName": token.username, "vin": vehicle.VIN}
+        response = self.session.post(url, headers=headers, json=data)
+        response_json = _safe_parse_json(response, "start_hazard_lights_and_horn")
+        if response_json is not None:
+            _check_response_for_errors(response_json)
+        _LOGGER.debug(
+            f"{DOMAIN} - Received start_hazard_lights_and_horn response status code: "
+            f"{response.status_code}"
+        )
+        _LOGGER.debug(
+            f"{DOMAIN} - Received start_hazard_lights_and_horn response: {response.text}"
+        )
+
+        action_id = self._get_transaction_id(response)
+        if action_id:
+            self._action_service_types[action_id] = "HORN_AND_LIGHTS"
+        return action_id

@@ -381,7 +381,7 @@ class DateTimeEncoder(json.JSONEncoder):
 
 
 def cmd_info(vm, args):
-    for vehicle_id, vehicle in vm.vehicles.items():
+    for vehicle in vm.vehicles.values():
         print_vehicle(vehicle)
     if args.json:
         data = {id: vehicle_to_dict(v) for id, v in vm.vehicles.items()}
@@ -448,8 +448,8 @@ def main():
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.ERROR)
 
     # Reverse lookup.
-    region = [k for k, v in const.REGIONS.items() if v == args.region][0]
-    brand = [k for k, v in const.BRANDS.items() if v == args.brand][0]
+    region = next(k for k, v in const.REGIONS.items() if v == args.region)
+    brand = next(k for k, v in const.BRANDS.items() if v == args.brand)
 
     vm = hyundai_kia_connect_api.VehicleManager(
         region=region,
@@ -460,7 +460,6 @@ def main():
         geocode_api_enable=True,
         geocode_api_use_email=True,
     )
-    # TODO: Cache token.
     vm.check_and_refresh_token()
     vm.update_all_vehicles_with_cached_state()
     return args.func(vm, args)

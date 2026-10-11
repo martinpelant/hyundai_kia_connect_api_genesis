@@ -5,10 +5,16 @@ from .ApiImpl import (
     ClimateRequestOptions,
     WindowRequestOptions,
     ScheduleChargingClimateRequestOptions,
+    POIInfo,
+    POICoord,
 )
 
+from .svm import SVMDetails
 from .Token import Token
 from .Vehicle import Vehicle
 from .VehicleManager import VehicleManager
+
+from .HyundaiCciApiEU import HyundaiCciApiEU
+from .KiaCciApiEU import KiaCciApiEU
 
 from .const import WINDOW_STATE

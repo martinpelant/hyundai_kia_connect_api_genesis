@@ -3,14 +3,14 @@ ci:
     autoupdate_commit_msg: "chore: pre-commit autoupdate"
 repos:
     - repo: https://github.com/astral-sh/ruff-pre-commit
-      rev: v0.15.2
+      rev: v0.16.10
       hooks:
           - id: ruff
             args:
                 - --fix
           - id: ruff-format
     - repo: https://github.com/codespell-project/codespell
-      rev: v2.4.1
+      rev: v2.4.3
       hooks:
           - id: codespell
             args:
@@ -18,6 +18,7 @@ repos:
                 - --skip="./.*,*.csv,*.json,*.ambr"
                 - --quiet-level=2
             exclude_types: [csv, json]
+            exclude: "cipher_params.json"
     - repo: https://github.com/pre-commit/pre-commit-hooks
       rev: v6.0.0
       hooks:
@@ -31,6 +32,8 @@ repos:
       rev: v3.21.2
       hooks:
           - id: pyupgrade
+            args:
+                - --py312-plus
     - repo: https://github.com/adrienverge/yamllint.git
       rev: v1.38.0
       hooks:
@@ -50,12 +53,12 @@ repos:
           - id: python-typing-update
             stages: [manual]
             args:
-                - --py311-plus
+                - --py312-plus
                 - --force
                 - --keep-updates
             files: ^(/.+)?[^/]+\.py$
     - repo: https://github.com/pre-commit/mirrors-mypy
-      rev: v1.19.1
+      rev: v2.4.0
       hooks:
           - id: mypy
             args: [--strict, --ignore-missing-imports]
