@@ -7,6 +7,7 @@ import datetime as dt
 import hashlib
 import json
 import logging
+import random
 import re
 import time
 from time import sleep
@@ -276,12 +277,16 @@ class KiaUvoApiEU(ApiImplType1):
 
                 valid_until = dt.datetime.now(dt.UTC) + dt.timedelta(minutes=50)
 
+                device_id = token_data.get("device_id")
+                if not device_id:
+                    device_id = self._get_device_id(self._get_stamp())
+
                 token = Token(
                     username=username,
                     password=password,
                     access_token=access_token,
                     refresh_token=token_data.get("r"),
-                    device_id=token_data.get("device_id") or str(uuid.uuid4()),
+                    device_id=device_id,
                     valid_until=valid_until,
                     pin=pin,
                     cci_access_token=access_token,
@@ -307,12 +312,19 @@ class KiaUvoApiEU(ApiImplType1):
 
                 valid_until = dt.datetime.now(dt.UTC) + dt.timedelta(minutes=50)
 
+                device_id = token_data.get("device_id")
+                if not device_id:
+                    if BRANDS[self.brand] == BRAND_GENESIS:
+                        device_id = self._get_device_id(self._get_stamp())
+                    else:
+                        device_id = str(uuid.uuid4())
+
                 token = Token(
                     username=username,
                     password=password,
                     access_token=access_token,
                     refresh_token=token_data.get("r") or token_data.get("refreshToken"),
-                    device_id=token_data.get("device_id") or str(uuid.uuid4()),
+                    device_id=device_id,
                     valid_until=valid_until,
                     pin=pin,
                     cci_access_token=access_token,
@@ -1706,12 +1718,13 @@ class KiaUvoApiEU(ApiImplType1):
             auth_token = getattr(token, "ccs_token", None) or token.access_token
             if auth_token and not auth_token.lower().startswith("bearer "):
                 auth_token = f"Bearer {auth_token}"
-            dev_id = token.device_id or str(uuid.uuid4())
+            if not getattr(token, "device_id", None):
+                token.device_id = self._get_device_id(self._get_stamp())
             return {
                 "Authorization": auth_token,
                 "ccsp-service-id": self.LEGACY_CCSP_SERVICE_ID,
                 "ccsp-application-id": self.LEGACY_APP_ID,
-                "ccsp-device-id": dev_id,
+                "ccsp-device-id": token.device_id,
                 "Stamp": self._get_stamp(),
                 "Host": f"{self.LEGACY_DOMAIN}:{self.PORT}",
                 "Connection": "Keep-Alive",
@@ -1721,6 +1734,46 @@ class KiaUvoApiEU(ApiImplType1):
                 "Content-Type": "application/json;charset=UTF-8",
             }
         return super()._get_authenticated_headers(token, ccs2_support)
+
+    def _get_stamp(self) -> str:
+        app_id = (
+            self.LEGACY_APP_ID
+            if BRANDS[self.brand] == BRAND_GENESIS
+            else self.APP_ID
+        )
+        raw_data = f"{app_id}:{int(dt.datetime.now().timestamp())}".encode()
+        result = bytes(b1 ^ b2 for b1, b2 in zip(self.CFB, raw_data))
+        return base64.b64encode(result).decode("utf-8")
+
+    def _get_device_id(self, stamp: str):
+        if BRANDS[self.brand] == BRAND_GENESIS:
+            my_hex = f"{random.randrange(10**80):064x}"
+            registration_id = my_hex[:64]
+            url = self.SPA_API_URL + "notifications/register"
+            payload = {
+                "pushRegId": registration_id,
+                "pushType": self.PUSH_TYPE,
+                "uuid": str(uuid.uuid4()),
+            }
+            headers = {
+                "ccsp-service-id": self.LEGACY_CCSP_SERVICE_ID,
+                "ccsp-application-id": self.LEGACY_APP_ID,
+                "Stamp": stamp,
+                "Content-Type": "application/json;charset=UTF-8",
+                "Host": f"{self.LEGACY_DOMAIN}:{self.PORT}",
+                "Connection": "Keep-Alive",
+                "Accept-Encoding": "gzip",
+                "User-Agent": USER_AGENT_OK_HTTP,
+            }
+            _LOGGER.debug(
+                f"{DOMAIN} - Genesis Get Device ID request: {url} {headers} {payload}"
+            )
+            response = requests.post(url, headers=headers, json=payload)
+            response = response.json()
+            _check_response_for_errors(response)
+            _LOGGER.debug(f"{DOMAIN} - Genesis Get Device ID response: {response}")
+            return response["resMsg"]["deviceId"]
+        return super()._get_device_id(stamp)
 
     def _get_control_headers(self, token: Token, vehicle: Vehicle) -> dict:
         if BRANDS[self.brand] == BRAND_GENESIS:

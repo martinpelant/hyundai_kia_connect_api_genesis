@@ -197,3 +197,46 @@ def test_genesis_authenticated_headers_use_legacy_domain():
     assert headers["ccsp-application-id"] == "f11f2b86-e0e7-4851-90df-5600b01d8b70"
     assert headers["ccsp-device-id"] == "dev-456"
     assert headers["Host"] == "prd-eu-ccapi.genesis.com:443"
+
+
+def test_genesis_device_id_registration_and_stamp():
+    api = _make_genesis_api()
+
+    # Stamp check
+    stamp = api._get_stamp()
+    assert isinstance(stamp, str)
+    assert len(stamp) > 0
+
+    # Device ID check
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "retCode": "S",
+        "resCode": "0000",
+        "resMsg": {"deviceId": "registered-device-id-123"},
+    }
+
+    with patch("requests.post", return_value=mock_resp) as mock_post:
+        dev_id = api._get_device_id("test-stamp")
+        assert dev_id == "registered-device-id-123"
+        call_args = mock_post.call_args
+        assert call_args[0][0] == "https://prd-eu-ccapi.genesis.com:443/api/v1/spa/notifications/register"
+        headers = call_args[1]["headers"]
+        assert headers["ccsp-service-id"] == "3020afa2-30ff-412a-aa51-d28fbe901e10"
+        assert headers["ccsp-application-id"] == "f11f2b86-e0e7-4851-90df-5600b01d8b70"
+        assert headers["Host"] == "prd-eu-ccapi.genesis.com:443"
+
+
+def test_genesis_login_registers_device_id_when_missing():
+    api = _make_genesis_api()
+    encoded_token = _make_genesis_token_b64()
+
+    with (
+        patch.object(api, "_exchange_ccs_token_genesis"),
+        patch.object(api, "_get_device_id", return_value="registered-dev-uuid") as mock_get_dev,
+        patch.object(api, "_get_stamp", return_value="stamp"),
+    ):
+        token = api.login("user@example.com", encoded_token)
+        mock_get_dev.assert_called_once_with("stamp")
+        assert token.device_id == "registered-dev-uuid"
+
